@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Humanizer Pro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen p-10">
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-4xl font-bold mb-6 text-center text-blue-400">AI Detector & Humanizer</h1>
+        
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <!-- Input Area -->
+            <div>
+                <label class="block mb-2 font-semibold">Input AI Text:</label>
+                <textarea id="inputText" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Paste your AI content here..."></textarea>
+                <div class="mt-4 space-x-2">
+                    <button onclick="process('detect')" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold">Detect AI</button>
+                    <button onclick="process('humanize')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-bold text-white">Humanize Text</button>
+                </div>
+            </div>
+
+            <!-- Output Area -->
+            <div>
+                <label class="block mb-2 font-semibold">Results:</label>
+                <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto">
+                    <p id="scoreText" class="text-xl font-bold text-yellow-400 mb-2"></p>
+                    <p id="outputText" class="text-gray-300"></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        async function process(type) {
+            const text = document.getElementById('inputText').value;
+            const scoreDisplay = document.getElementById('scoreText');
+            const outputDisplay = document.getElementById('outputText');
+
+            if (!text) return alert("Please enter text");
+
+            scoreDisplay.innerText = "Processing...";
+            outputDisplay.innerText = "";
+
+            try {
+                const response = await fetch(`http://localhost:8000/${type}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ text: text })
+                });
+                const data = await response.json();
+
+                if (type === 'detect') {
+                    scoreDisplay.innerText = `AI Probability: ${data.ai_probability}`;
+                    outputDisplay.innerText = `Verdict: ${data.status}`;
+                } else {
+                    scoreDisplay.innerText = `New AI Score: ${data.new_ai_score}`;
+                    outputDisplay.innerText = data.humanized_text;
+                }
+            } catch (err) {
+                scoreDisplay.innerText = "Error connecting to server.";
+            }
+        }
+    </script>
+</body>
+</html>
