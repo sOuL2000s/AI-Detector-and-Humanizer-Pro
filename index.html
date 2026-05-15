@@ -44,7 +44,8 @@
             outputDisplay.innerText = "";
 
             try {
-                const response = await fetch(`http://localhost:8000/${type}`, {
+                // Use relative path so it works regardless of host
+                const response = await fetch(`/${type}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ text: text })

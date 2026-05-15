@@ -111,17 +111,35 @@ Create a file named `main.py`. This handles the logic for both detection and hum
 ```python
 import uvicorn
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from transformers import pipeline
 from groq import Groq
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # --- CONFIGURATION ---
-# Get a free API key from https://console.groq.com/
-GROQ_API_KEY = "YOUR_GROQ_API_KEY_HERE" 
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
+
 client = Groq(api_key=GROQ_API_KEY)
 
 app = FastAPI(title="AI Detector & Humanizer API")
+
+# Enable CORS for frontend communication
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Load the AI Detector Model (RoBERTa-base-openai-detector)
 print("Loading AI Detector model... please wait.")
@@ -203,8 +221,13 @@ async def humanize(request: TextRequest):
         "new_ai_score": f"{new_score}%"
     }
 
+@app.get("/")
+async def serve_index():
+    return FileResponse("index.html")
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Changed host to 127.0.0.1 for local access compatibility
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 ```
 
 ---
@@ -259,7 +282,8 @@ Create a file named `index.html`. This provides a clean interface.
             outputDisplay.innerText = "";
 
             try {
-                const response = await fetch(`http://localhost:8000/${type}`, {
+                // Use relative path so it works regardless of host
+                const response = await fetch(`/${type}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ text: text })
