@@ -124,36 +124,18 @@ classifier_model_id = "desklib/ai-text-detector-v1.01"
 classifier_tokenizer = AutoTokenizer.from_pretrained(classifier_model_id)
 
 try:
-    # Attempt to load using standard sequence classification class (works for most modern HF models)
-    classifier_model = AutoModelForSequenceClassification.from_pretrained(classifier_model_id)
+    # Attempt to load using standard sequence classification class
+    # ignore_mismatched_sizes=True is critical for models with custom head dimensions
+    classifier_model = AutoModelForSequenceClassification.from_pretrained(
+        classifier_model_id, 
+        ignore_mismatched_sizes=True,
+        num_labels=1
+    )
 except Exception as e:
-    print(f"Standard loading failed, using robust custom architecture fallback...")
-    # Fallback to a custom class that handles internal weight tying correctly for newer library versions
-    class DesklibAIDetectionModel(PreTrainedModel):
-        config_class = AutoConfig
-        def __init__(self, config):
-            super().__init__(config)
-            # The checkpoint uses 'model' as the attribute name for the base transformer
-            self.model = AutoModel.from_config(config)
-            self.classifier = nn.Linear(config.hidden_size, 1)
-            # post_init() handles modern weight initialization and tying
-            self.post_init()
-        
-        def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
-            # Accept **kwargs to handle 'token_type_ids' passed by the tokenizer
-            outputs = self.model(input_ids, attention_mask=attention_mask, **kwargs)
-            last_hidden_state = outputs[0]
-            
-            # Global Average Pooling (Mean Pooling)
-            input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-            sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
-            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
-            pooled_output = sum_embeddings / sum_mask
-            
-            logits = self.classifier(pooled_output)
-            return type('Outputs', (object,), {'logits': logits})()
-
-    classifier_model = DesklibAIDetectionModel.from_pretrained(classifier_model_id)
+    print(f"Standard loading failed: {e}. Using pipeline fallback...")
+    # Use pipeline as a robust secondary fallback; it handles architecture loading internally
+    _pipe = pipeline("text-classification", model=classifier_model_id, tokenizer=classifier_tokenizer)
+    classifier_model = _pipe.model
 
 classifier_model.eval()
 if torch.cuda.is_available():
