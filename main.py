@@ -23,6 +23,7 @@ import io
 import pypdf
 import tiktoken
 import time
+import re
 from dotenv import load_dotenv
 
 import sys
@@ -167,38 +168,84 @@ def get_binoculars_score(text: str):
     except:
         return 50
 
+def get_burstiness_score(text: str):
+    """Calculates sentence length variance (Burstiness). AI text is uniform; Humans use bursts."""
+    sentences = re.split(r'[.!?]+', text)
+    sentences = [s.strip() for s in sentences if len(s.strip()) > 5]
+    if len(sentences) < 3:
+        return 50
+    
+    lengths = [len(s.split()) for s in sentences]
+    mean = sum(lengths) / len(lengths)
+    variance = sum((x - mean) ** 2 for x in lengths) / len(lengths)
+    std_dev = math.sqrt(variance)
+    
+    # High std_dev (> 12) -> Human (0 score). Low std_dev (< 3) -> AI (100 score).
+    norm_score = max(0, min(100, 100 - (std_dev * 6)))
+    return norm_score
+
+def get_ai_fingerprint_score(text: str):
+    """Checks for density of 'LLMisms' (Fingerprints)."""
+    llmisms = ['delve', 'testament', 'comprehensive', 'meticulous', 'unlocking', 
+               'pivotal', 'synergy', 'transformative', 'vibrant', 'embark', 
+               'underscore', 'tailored', 'seamless', 'holistic', 'invaluable', 'notably']
+    
+    words = re.findall(r'\w+', text.lower())
+    if not words:
+        return 0
+    
+    hits = sum(1 for word in words if word in llmisms)
+    density = (hits / len(words)) * 100
+    
+    # Approximately 1% density of these specific words is a strong AI indicator
+    norm_score = max(0, min(100, density * 120))
+    return norm_score
+
 def get_ai_score(text: str):
     """
     Returns the ensemble probability of the text being AI-generated.
-    Weighting: 40% DeBERTa, 40% Binoculars (Proxy), 20% Perplexity
+    Weighted Calculation: 
+    - 30% DeBERTa (Neural)
+    - 25% Binoculars (Predictability)
+    - 15% Perplexity (Randomness)
+    - 15% Burstiness (Sentence Length Variance)
+    - 15% Fingerprints (Vocabulary Patterns)
     """
-    # 1. DeBERTa Neural Classification (40%)
+    # 1. DeBERTa Neural Classification (30%)
     inputs = classifier_tokenizer(text[:1500], return_tensors="pt", truncation=True, max_length=512)
     if torch.cuda.is_available():
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
     
     with torch.no_grad():
         outputs = classifier_model(**inputs)
-        # Handle both dict-like and attribute-like access for maximum compatibility
         if hasattr(outputs, 'logits'):
             logits = outputs.logits
         elif isinstance(outputs, dict) and 'logits' in outputs:
             logits = outputs['logits']
         else:
-            logits = outputs[0] # Fallback for tuple returns
-            
-        # Convert single logit to probability
+            logits = outputs[0]
         deberta_score = torch.sigmoid(logits).item() * 100
 
-
-    # 2. Binoculars Predictability Analysis (40%)
+    # 2. Binoculars Predictability Analysis (25%)
     binoculars_score = get_binoculars_score(text[:1000])
 
-    # 3. Statistical Perplexity Check (20%)
+    # 3. Statistical Perplexity Check (15%)
     perplexity_score = get_perplexity(text[:1000])
 
+    # 4. Burstiness Analysis (15%)
+    burstiness_score = get_burstiness_score(text)
+
+    # 5. Fingerprint Density Check (15%)
+    fingerprint_score = get_ai_fingerprint_score(text)
+
     # Final Weighted Calculation
-    final_score = (deberta_score * 0.40) + (binoculars_score * 0.40) + (perplexity_score * 0.20)
+    final_score = (
+        (deberta_score * 0.30) + 
+        (binoculars_score * 0.25) + 
+        (perplexity_score * 0.15) + 
+        (burstiness_score * 0.15) + 
+        (fingerprint_score * 0.15)
+    )
     
     return round(final_score, 2)
 
@@ -275,10 +322,16 @@ async def stream_detection(text: str):
         
         # Calculate sub-scores for detailed logging
         ppl = get_perplexity(text[:1000])
-        yield json.dumps({"log": f"Statistical Perplexity: {round(ppl, 1)}% AI signals.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Perplexity Analysis: {round(ppl, 1)}% AI probability.", "log_type": "info"}) + "\n"
         
         bino = get_binoculars_score(text[:1000])
-        yield json.dumps({"log": f"Binoculars Entropy: {round(bino, 1)}% predictability.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Predictability (Entropy): {round(bino, 1)}% AI probability.", "log_type": "info"}) + "\n"
+
+        burst = get_burstiness_score(text)
+        yield json.dumps({"log": f"Burstiness (Structure): {round(burst, 1)}% uniformity (AI-like).", "log_type": "info"}) + "\n"
+
+        fing = get_ai_fingerprint_score(text)
+        yield json.dumps({"log": f"AI Fingerprints: {round(fing, 1)}% common LLM vocabulary density.", "log_type": "info"}) + "\n"
         
         yield json.dumps({"log": "Running DeBERTa-v3 neural classifier...", "log_type": "process"}) + "\n"
         score = get_ai_score(text)
