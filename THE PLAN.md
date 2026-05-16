@@ -124,7 +124,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 import json
-from transformers import pipeline
+import torch
+import math
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer, AutoModelForCausalLM, AutoConfig, AutoModel, PreTrainedModel
+import torch.nn as nn
 from groq import Groq
 import os
 import io
@@ -170,9 +173,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the AI Detector Model (RoBERTa-base-openai-detector)
-print("Loading AI Detector model... please wait.")
-detector_pipe = pipeline("text-classification", model="roberta-base-openai-detector")
+# --- ENSEMBLE DETECTOR CONFIG ---
+# 1. DeBERTa-v3 Classifier (Industry standard for precision)
+# Using AutoModelForSequenceClassification is more robust against Transformers version changes
+print("Loading DeBERTa-v3 Classifier...")
+classifier_model_id = "desklib/ai-text-detector-v1.01" 
+classifier_tokenizer = AutoTokenizer.from_pretrained(classifier_model_id)
+
+try:
+    # Attempt to load using standard sequence classification class (works for most modern HF models)
+    classifier_model = AutoModelForSequenceClassification.from_pretrained(classifier_model_id)
+except Exception as e:
+    print(f"Standard loading failed, using robust custom architecture fallback...")
+    # Fallback to a custom class that handles internal weight tying correctly for newer library versions
+    class DesklibAIDetectionModel(PreTrainedModel):
+        config_class = AutoConfig
+        def __init__(self, config):
+            super().__init__(config)
+            # The checkpoint uses 'model' as the attribute name for the base transformer
+            self.model = AutoModel.from_config(config)
+            self.classifier = nn.Linear(config.hidden_size, 1)
+            # post_init() handles modern weight initialization and tying
+            self.post_init()
+        
+        def forward(self, input_ids, attention_mask=None, labels=None, **kwargs):
+            # Accept **kwargs to handle 'token_type_ids' passed by the tokenizer
+            outputs = self.model(input_ids, attention_mask=attention_mask, **kwargs)
+            last_hidden_state = outputs[0]
+            
+            # Global Average Pooling (Mean Pooling)
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+            sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            pooled_output = sum_embeddings / sum_mask
+            
+            logits = self.classifier(pooled_output)
+            return type('Outputs', (object,), {'logits': logits})()
+
+    classifier_model = DesklibAIDetectionModel.from_pretrained(classifier_model_id)
+
+classifier_model.eval()
+if torch.cuda.is_available():
+    classifier_model = classifier_model.to("cuda")
+
+# 2. Perplexity and Binoculars-proxy Engine (GPT-2 for efficiency)
+print("Loading Perplexity & Entropy Engine (GPT-2)...")
+ppl_model_id = "gpt2"
+ppl_tokenizer = AutoTokenizer.from_pretrained(ppl_model_id)
+ppl_model = AutoModelForCausalLM.from_pretrained(ppl_model_id)
+if torch.cuda.is_available():
+    ppl_model = ppl_model.to("cuda")
 
 class TextRequest(BaseModel):
     text: str
@@ -185,6 +235,84 @@ def count_tokens(text: str):
     except:
         return len(text) // 4 # Fallback to rough estimate
 
+def get_perplexity(text: str):
+    """Calculates perplexity of the text using GPT-2. Human text = High Perplexity."""
+    if not text.strip():
+        return 0
+    try:
+        inputs = ppl_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            outputs = ppl_model(**inputs, labels=inputs["input_ids"])
+            loss = outputs.loss
+            perplexity = torch.exp(loss).item()
+        
+        # Normalize: Lower perplexity -> Higher AI probability
+        norm_score = max(0, min(100, (100 - (perplexity / 1.5))))
+        return norm_score
+    except:
+        return 50
+
+def get_binoculars_score(text: str):
+    """
+    Zero-shot detection proxy. 
+    Uses token distribution entropy as a measure of predictability.
+    AI text tends to have lower entropy (highly predictable).
+    """
+    try:
+        inputs = ppl_tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+        if torch.cuda.is_available():
+            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            logits = ppl_model(**inputs).logits
+            probs = torch.softmax(logits, dim=-1)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            entropy = -(probs * log_probs).sum(dim=-1).mean().item()
+            
+        # Lower entropy -> higher predictability (AI-like)
+        norm_score = max(0, min(100, (8 - entropy) * 12.5)) 
+        return norm_score
+    except:
+        return 50
+
+def get_ai_score(text: str):
+    """
+    Returns the ensemble probability of the text being AI-generated.
+    Weighting: 40% DeBERTa, 40% Binoculars (Proxy), 20% Perplexity
+    """
+    # 1. DeBERTa Neural Classification (40%)
+    inputs = classifier_tokenizer(text[:1500], return_tensors="pt", truncation=True, max_length=512)
+    if torch.cuda.is_available():
+        inputs = {k: v.to("cuda") for k, v in inputs.items()}
+    
+    with torch.no_grad():
+        outputs = classifier_model(**inputs)
+        # Handle both dict-like and attribute-like access for maximum compatibility
+        if hasattr(outputs, 'logits'):
+            logits = outputs.logits
+        elif isinstance(outputs, dict) and 'logits' in outputs:
+            logits = outputs['logits']
+        else:
+            logits = outputs[0] # Fallback for tuple returns
+            
+        # Convert single logit to probability
+        deberta_score = torch.sigmoid(logits).item() * 100
+
+
+    # 2. Binoculars Predictability Analysis (40%)
+    binoculars_score = get_binoculars_score(text[:1000])
+
+    # 3. Statistical Perplexity Check (20%)
+    perplexity_score = get_perplexity(text[:1000])
+
+    # Final Weighted Calculation
+    final_score = (deberta_score * 0.40) + (binoculars_score * 0.40) + (perplexity_score * 0.20)
+    
+    return round(final_score, 2)
+
 def chunk_text_by_tokens(text: str, max_tokens: int):
     """Splits text into chunks based on token counts."""
     encoding = tiktoken.get_encoding("cl100k_base")
@@ -194,18 +322,6 @@ def chunk_text_by_tokens(text: str, max_tokens: int):
         chunk_tokens = tokens[i : i + max_tokens]
         chunks.append(encoding.decode(chunk_tokens))
     return chunks
-
-def get_ai_score(text: str):
-    """Returns the probability of the text being AI-generated."""
-    # RoBERTa has a 512 token limit. We use the first ~1000 chars as a safe proxy.
-    results = detector_pipe(text[:1000])
-    score = 0
-    for res in results:
-        if res['label'] == 'Fake':
-            score = res['score']
-        else:
-            score = 1 - res['score']
-    return round(score * 100, 2)
 
 def humanize_logic(text: str):
     """The 'Secret Sauce' Humanizer Loop with automatic chunking for rate-limit safety."""
@@ -266,11 +382,19 @@ def _process_chunk(chunk_text: str, system_prompt: str):
 
 async def stream_detection(text: str):
     try:
-        yield json.dumps({"log": "Analyzing linguistic patterns...", "log_type": "process"}) + "\n"
-        time.sleep(0.5)
-        yield json.dumps({"log": "Running RoBERTa classifier...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Initializing Ensemble Detection Engine...", "log_type": "process"}) + "\n"
+        
+        # Calculate sub-scores for detailed logging
+        ppl = get_perplexity(text[:1000])
+        yield json.dumps({"log": f"Statistical Perplexity: {round(ppl, 1)}% AI signals.", "log_type": "info"}) + "\n"
+        
+        bino = get_binoculars_score(text[:1000])
+        yield json.dumps({"log": f"Binoculars Entropy: {round(bino, 1)}% predictability.", "log_type": "info"}) + "\n"
+        
+        yield json.dumps({"log": "Running DeBERTa-v3 neural classifier...", "log_type": "process"}) + "\n"
         score = get_ai_score(text)
-        yield json.dumps({"log": f"Calculated AI Probability: {score}%", "log_type": "info"}) + "\n"
+        
+        yield json.dumps({"log": f"Final Weighted Confidence: {score}%", "log_type": "info"}) + "\n"
         
         status = "AI" if score > 50 else "Human"
         yield json.dumps({
