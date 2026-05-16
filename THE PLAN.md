@@ -110,13 +110,18 @@ Create a file named `main.py`. This handles the logic for both detection and hum
 
 ```python
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
+import json
 from transformers import pipeline
 from groq import Groq
 import os
+import io
+import pypdf
+import tiktoken
+import time
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -124,6 +129,11 @@ load_dotenv()
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL_NAME = "llama-3.3-70b-versatile"
+CONTEXT_WINDOW = 128000 
+# Max tokens per chunk to stay under Groq's free tier TPM limits (e.g., 12,000)
+# We use 4,000 to leave room for the system prompt and the model's generated response.
+CHUNK_TOKEN_LIMIT = 4000 
 
 if not GROQ_API_KEY:
     raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
@@ -148,12 +158,28 @@ detector_pipe = pipeline("text-classification", model="roberta-base-openai-detec
 class TextRequest(BaseModel):
     text: str
 
+def count_tokens(text: str):
+    """Accurately count tokens using tiktoken (cl100k_base is used as a proxy for Llama 3)."""
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    except:
+        return len(text) // 4 # Fallback to rough estimate
+
+def chunk_text_by_tokens(text: str, max_tokens: int):
+    """Splits text into chunks based on token counts."""
+    encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode(text)
+    chunks = []
+    for i in range(0, len(tokens), max_tokens):
+        chunk_tokens = tokens[i : i + max_tokens]
+        chunks.append(encoding.decode(chunk_tokens))
+    return chunks
+
 def get_ai_score(text: str):
     """Returns the probability of the text being AI-generated."""
-    # Truncate text to 512 tokens for the model
-    results = detector_pipe(text[:512])
-    # The model returns labels like 'Real' or 'Fake'
-    # We want to return the 'Fake' (AI) score
+    # RoBERTa has a 512 token limit. We use the first ~1000 chars as a safe proxy.
+    results = detector_pipe(text[:1000])
     score = 0
     for res in results:
         if res['label'] == 'Fake':
@@ -163,7 +189,7 @@ def get_ai_score(text: str):
     return round(score * 100, 2)
 
 def humanize_logic(text: str):
-    """The 'Secret Sauce' Humanizer Loop"""
+    """The 'Secret Sauce' Humanizer Loop with automatic chunking for rate-limit safety."""
     system_prompt = (
         "Rewrite the following text to make it indistinguishable from human writing. "
         "Use varying sentence structures (burstiness), natural idioms, and a conversational flow. "
@@ -171,55 +197,161 @@ def humanize_logic(text: str):
         "Avoid over-used AI words like 'delve', 'meticulous', and 'comprehensive'."
     )
     
-    # 1st Pass Humanization
-    completion = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text}
-        ],
-        temperature=0.8, # Higher temp = more human-like randomness
-    )
+    token_count = count_tokens(text)
     
-    humanized_text = completion.choices[0].message.content
+    if token_count <= CHUNK_TOKEN_LIMIT:
+        return _process_chunk(text, system_prompt)
     
-    # Verification Loop: Check if it still looks like AI
-    score = get_ai_score(humanized_text)
+    print(f"Large text detected ({token_count} tokens). Processing in chunks...")
+    chunks = chunk_text_by_tokens(text, CHUNK_TOKEN_LIMIT)
+    humanized_chunks = []
     
-    # If score is still high (>30%), do one more aggressive pass
-    if score > 30:
-        completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": "The previous attempt still looks like AI. Rewrite this again. Be more creative, change sentence lengths more drastically, and use less predictable vocabulary."},
-                {"role": "user", "content": humanized_text}
-            ],
-            temperature=0.9,
-        )
-        humanized_text = completion.choices[0].message.content
+    for i, chunk in enumerate(chunks):
+        print(f"Humanizing chunk {i+1}/{len(chunks)}...")
+        humanized_chunks.append(_process_chunk(chunk, system_prompt))
+        # Small sleep to help avoid hitting RPM (Requests Per Minute) limits
+        if i < len(chunks) - 1:
+            time.sleep(1.5)
+            
+    return "\n\n".join(humanized_chunks)
 
-    return humanized_text
+def _process_chunk(chunk_text: str, system_prompt: str):
+    """Internal helper to humanize individual segments."""
+    try:
+        completion = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": chunk_text}
+            ],
+            temperature=0.8,
+        )
+        humanized = completion.choices[0].message.content
+        
+        # Quick verification/re-pass if score is still high
+        if get_ai_score(humanized) > 30:
+            completion = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[
+                    {"role": "system", "content": "The previous attempt still looks like AI. Rewrite more creatively with varied sentence lengths."},
+                    {"role": "user", "content": humanized}
+                ],
+                temperature=0.9,
+            )
+            humanized = completion.choices[0].message.content
+        return humanized
+    except Exception as e:
+        if "rate_limit_exceeded" in str(e).lower():
+            raise HTTPException(status_code=429, detail="API Rate Limit Exceeded. Please try a smaller text or wait a minute.")
+        raise e
+
+async def stream_detection(text: str):
+    try:
+        yield json.dumps({"log": "Analyzing linguistic patterns...", "log_type": "process"}) + "\n"
+        time.sleep(0.5)
+        yield json.dumps({"log": "Running RoBERTa classifier...", "log_type": "process"}) + "\n"
+        score = get_ai_score(text)
+        yield json.dumps({"log": f"Calculated AI Probability: {score}%", "log_type": "info"}) + "\n"
+        
+        status = "AI" if score > 50 else "Human"
+        yield json.dumps({
+            "final_result": {"ai_probability": f"{score}%", "status": status}
+        }) + "\n"
+    except Exception as e:
+        yield json.dumps({"error": str(e)}) + "\n"
 
 @app.post("/detect")
 async def detect(request: TextRequest):
     if not request.text:
         raise HTTPException(status_code=400, detail="No text provided")
-    score = get_ai_score(request.text)
-    return {"ai_probability": f"{score}%", "status": "AI" if score > 50 else "Human"}
+    return StreamingResponse(stream_detection(request.text), media_type="application/x-ndjson")
+
+async def stream_humanization(text: str):
+    try:
+        system_prompt = (
+            "Rewrite the following text to make it indistinguishable from human writing. "
+            "Use varying sentence structures (burstiness), natural idioms, and a conversational flow. "
+            "Ensure it passes AI detection while maintaining the original meaning and professional quality. "
+            "Avoid over-used AI words like 'delve', 'meticulous', and 'comprehensive'."
+        )
+        
+        token_count = count_tokens(text)
+        yield json.dumps({"log": f"Input analysis: {token_count} tokens detected.", "log_type": "info"}) + "\n"
+        
+        if token_count <= CHUNK_TOKEN_LIMIT:
+            yield json.dumps({"log": "Processing single segment...", "log_type": "process"}) + "\n"
+            humanized = _process_chunk(text, system_prompt)
+            yield json.dumps({"log": "Applying secondary verification pass...", "log_type": "process"}) + "\n"
+        else:
+            yield json.dumps({"log": f"Large text detected. Splitting into chunks...", "log_type": "warning"}) + "\n"
+            chunks = chunk_text_by_tokens(text, CHUNK_TOKEN_LIMIT)
+            humanized_chunks = []
+            
+            for i, chunk in enumerate(chunks):
+                yield json.dumps({"log": f"Humanizing chunk {i+1} of {len(chunks)}...", "log_type": "process"}) + "\n"
+                humanized_chunks.append(_process_chunk(chunk, system_prompt))
+                if i < len(chunks) - 1:
+                    yield json.dumps({"log": "Cooling down for rate limit safety...", "log_type": "info"}) + "\n"
+                    time.sleep(1.5)
+            humanized = "\n\n".join(humanized_chunks)
+
+        yield json.dumps({"log": "Calculating final AI score...", "log_type": "process"}) + "\n"
+        new_score = get_ai_score(humanized)
+        
+        yield json.dumps({
+            "final_result": {
+                "original_text": text,
+                "humanized_text": humanized,
+                "new_ai_score": f"{new_score}%"
+            }
+        }) + "\n"
+    except Exception as e:
+        error_msg = str(e)
+        if "rate_limit_exceeded" in error_msg.lower():
+            error_msg = "Groq API Rate Limit Hit. Please wait a moment or use shorter text."
+        yield json.dumps({"error": error_msg}) + "\n"
 
 @app.post("/humanize")
 async def humanize(request: TextRequest):
     if not request.text:
         raise HTTPException(status_code=400, detail="No text provided")
-    
-    humanized = humanize_logic(request.text)
-    new_score = get_ai_score(humanized)
-    
+    return StreamingResponse(stream_humanization(request.text), media_type="application/x-ndjson")
+
+@app.post("/count-tokens")
+async def get_token_count(request: TextRequest):
+    return {"tokens": count_tokens(request.text)}
+
+@app.get("/limits")
+async def get_limits():
+    """Returns the model limits for the frontend to display."""
     return {
-        "original_text": request.text,
-        "humanized_text": humanized,
-        "new_ai_score": f"{new_score}%"
+        "model": MODEL_NAME,
+        "context_window": CONTEXT_WINDOW,
+        "chunk_size": CHUNK_TOKEN_LIMIT,
+        "explanation": "Groq's free tier has Rate Limits (TPM/RPM). Text exceeding the chunk size will be automatically split."
     }
+
+@app.post("/extract-pdf")
+async def extract_pdf(file: UploadFile = File(...)):
+    """Extracts text content from an uploaded PDF file."""
+    if file.content_type != "application/pdf":
+        raise HTTPException(status_code=400, detail="Invalid file type. Only PDF allowed.")
+    
+    try:
+        pdf_content = await file.read()
+        pdf_reader = pypdf.PdfReader(io.BytesIO(pdf_content))
+        text = ""
+        for page in pdf_reader.pages:
+            extracted = page.extract_text()
+            if extracted:
+                text += extracted + "\n"
+        
+        if not text.strip():
+            raise HTTPException(status_code=400, detail="Could not extract any text from this PDF (it might be an image-only scan).")
+            
+        return {"text": text.strip()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading PDF: {str(e)}")
 
 @app.get("/")
 async def serve_index():
@@ -256,12 +388,16 @@ Create a file named `index.html`. This provides a clean interface.
                     <div class="space-x-2">
                         <button onclick="pasteText()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">Paste</button>
                         <label class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded cursor-pointer">
-                            Import File
-                            <input type="file" id="fileInput" class="hidden" accept=".txt,.md" onchange="importFile(this)">
+                            Import File (PDF/TXT)
+                            <input type="file" id="fileInput" class="hidden" accept=".txt,.md,.pdf" onchange="importFile(this)">
                         </label>
                     </div>
                 </div>
-                <textarea id="inputText" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Paste your AI content here..."></textarea>
+                <textarea id="inputText" oninput="updateStats()" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Paste your AI content here..."></textarea>
+                <div class="flex justify-between text-xs text-gray-400 mt-1 px-1">
+                    <span id="charCount">Characters: 0</span>
+                    <span id="tokenEst">Tokens: 0 / 128,000</span>
+                </div>
                 <div class="mt-4 space-x-2">
                     <button onclick="process('detect')" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold">Detect AI</button>
                     <button onclick="process('humanize')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-bold text-white">Humanize Text</button>
@@ -275,33 +411,120 @@ Create a file named `index.html`. This provides a clean interface.
                     <label class="font-semibold">Results:</label>
                     <button onclick="copyResults()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">Copy Result</button>
                 </div>
-                <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto relative">
+                <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto relative mb-4">
                     <p id="scoreText" class="text-xl font-bold text-yellow-400 mb-2"></p>
                     <p id="outputText" class="text-gray-300 whitespace-pre-wrap"></p>
+                </div>
+
+                <!-- Log Area -->
+                <div class="bg-black border border-gray-700 rounded-lg p-3 font-mono text-xs h-32 overflow-y-auto" id="logContainer">
+                    <div class="text-blue-400 mb-1 font-bold">[SYSTEM READY]</div>
+                    <div id="logContent" class="text-gray-400 space-y-1"></div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
+        function addLog(message, type = 'info') {
+            const logContent = document.getElementById('logContent');
+            const div = document.createElement('div');
+            const timestamp = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            
+            let color = 'text-gray-400';
+            if (type === 'success') color = 'text-green-400';
+            if (type === 'error') color = 'text-red-400';
+            if (type === 'warning') color = 'text-yellow-400';
+            if (type === 'process') color = 'text-blue-300';
+
+            div.innerHTML = `<span class="text-gray-600">[${timestamp}]</span> <span class="${color}">${message}</span>`;
+            logContent.appendChild(div);
+            document.getElementById('logContainer').scrollTop = document.getElementById('logContainer').scrollHeight;
+        }
+        let typingTimer;
+        function updateStats() {
+            const text = document.getElementById('inputText').value;
+            const charCount = text.length;
+            document.getElementById('charCount').innerText = `Characters: ${charCount.toLocaleString()}`;
+            
+            // Debounced actual token counting from backend
+            clearTimeout(typingTimer);
+            typingTimer = setTimeout(async () => {
+                if (!text) {
+                    document.getElementById('tokenEst').innerText = `Tokens: 0 / 128,000`;
+                    return;
+                }
+                try {
+                    const response = await fetch('/count-tokens', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: text })
+                    });
+                    const data = await response.json();
+                    const tokenEl = document.getElementById('tokenEst');
+                    tokenEl.innerText = `Tokens: ${data.tokens.toLocaleString()} / 128,000`;
+                    
+                    if (data.tokens > 4000) {
+                        tokenEl.classList.add('text-yellow-400');
+                        tokenEl.title = "Text is large and will be processed in multiple segments.";
+                    } else {
+                        tokenEl.classList.remove('text-yellow-400');
+                        tokenEl.title = "";
+                    }
+                } catch (e) {}
+            }, 500);
+        }
+
         async function pasteText() {
             try {
                 const text = await navigator.clipboard.readText();
                 document.getElementById('inputText').value = text;
+                updateStats();
             } catch (err) {
                 alert("Could not paste from clipboard. Please paste manually.");
             }
         }
 
-        function importFile(input) {
+        async function importFile(input) {
             const file = input.files[0];
             if (!file) return;
             
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                document.getElementById('inputText').value = e.target.result;
-            };
-            reader.readAsText(file);
+            // If it's a PDF, we send it to the server for extraction
+            if (file.type === "application/pdf") {
+                const formData = new FormData();
+                formData.append("file", file);
+                
+                const scoreDisplay = document.getElementById('scoreText');
+                scoreDisplay.innerText = "Extracting text from PDF...";
+
+                try {
+                    const response = await fetch("/extract-pdf", {
+                        method: "POST",
+                        body: formData
+                    });
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        document.getElementById('inputText').value = data.text;
+                        updateStats();
+                        scoreDisplay.innerText = "PDF Loaded Successfully.";
+                    } else {
+                        alert(data.detail || "Error extracting PDF");
+                        scoreDisplay.innerText = "";
+                    }
+                } catch (err) {
+                    alert("Connection error while uploading PDF.");
+                    scoreDisplay.innerText = "";
+                }
+            } else {
+                // Handle standard text files locally
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    document.getElementById('inputText').value = e.target.result;
+                    updateStats();
+                };
+                reader.readAsText(file);
+            }
         }
 
         async function copyResults() {
@@ -324,6 +547,8 @@ Create a file named `index.html`. This provides a clean interface.
 
             scoreDisplay.innerText = "Processing...";
             outputDisplay.innerText = "";
+            document.getElementById('logContent').innerHTML = ""; // Clear logs
+            addLog(`Initializing ${type} engine...`, 'process');
 
             try {
                 const response = await fetch(`/${type}`, {
@@ -331,17 +556,57 @@ Create a file named `index.html`. This provides a clean interface.
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ text: text })
                 });
-                const data = await response.json();
 
-                if (type === 'detect') {
-                    scoreDisplay.innerText = `AI Probability: ${data.ai_probability}`;
-                    outputDisplay.innerText = `Verdict: ${data.status}`;
-                } else {
-                    scoreDisplay.innerText = `New AI Score: ${data.new_ai_score}`;
-                    outputDisplay.innerText = data.humanized_text;
+                if (!response.body) {
+                    throw new Error("ReadableStream not supported.");
+                }
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, { stream: true });
+                    const lines = buffer.split("\n");
+                    buffer = lines.pop();
+
+                    for (const line of lines) {
+                        if (!line.trim()) continue;
+                        try {
+                            const data = JSON.parse(line);
+                            
+                            if (data.log) {
+                                addLog(data.log, data.log_type || 'info');
+                            }
+                            
+                            if (data.final_result) {
+                                const res = data.final_result;
+                                if (type === 'detect') {
+                                    scoreDisplay.innerText = `AI Probability: ${res.ai_probability}`;
+                                    outputDisplay.innerText = `Verdict: ${res.status}`;
+                                    addLog(`Detection complete. Verdict: ${res.status}`, 'success');
+                                } else {
+                                    scoreDisplay.innerText = `New AI Score: ${res.new_ai_score}`;
+                                    outputDisplay.innerText = res.humanized_text;
+                                    addLog(`Humanization complete. Final AI Score: ${res.new_ai_score}`, 'success');
+                                }
+                            }
+                            
+                            if (data.error) {
+                                scoreDisplay.innerText = "Error occurred.";
+                                addLog(data.error, 'error');
+                            }
+                        } catch (e) {
+                            console.error("JSON Parse Error", e, line);
+                        }
+                    }
                 }
             } catch (err) {
                 scoreDisplay.innerText = "Error connecting to server.";
+                addLog(`Connection error: ${err.message}`, 'error');
             }
         }
     </script>

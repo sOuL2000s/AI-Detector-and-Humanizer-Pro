@@ -17,7 +17,7 @@ A production-ready AI content detector and humanizer built with FastAPI, Hugging
 1. Clone this repository or download the source code.
 2. Install the required Python libraries:
    ```bash
-   pip install fastapi uvicorn transformers torch groq python-dotenv
+   pip install fastapi uvicorn transformers torch groq python-dotenv pypdf python-multipart tiktoken
    ```
 
 ### 3. Configuration
