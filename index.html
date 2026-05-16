@@ -7,6 +7,19 @@
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-10">
+    <!-- API Key Overlay -->
+    <div id="apiKeyModal" class="hidden fixed inset-0 bg-black bg-opacity-80 z-50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 border border-gray-700 p-8 rounded-xl max-w-md w-full">
+            <h2 class="text-2xl font-bold text-blue-400 mb-4">Setup Groq API Key</h2>
+            <p class="text-gray-400 mb-6 text-sm">To use the Humanizer, you need a free Groq API key. Your data stays on your machine.</p>
+            <input type="password" id="apiKeyInput" class="w-full p-3 bg-gray-900 border border-gray-700 rounded mb-4 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="gsk_...">
+            <div class="flex flex-col gap-3">
+                <button onclick="saveApiKey()" class="w-full bg-blue-600 hover:bg-blue-700 py-3 rounded-lg font-bold transition">Save Key</button>
+                <a href="https://console.groq.com/keys" target="_blank" class="text-center text-sm text-gray-400 hover:text-white underline">Don't have a key? Create one here (Groq Official)</a>
+            </div>
+        </div>
+    </div>
+
     <div class="max-w-4xl mx-auto">
         <h1 class="text-4xl font-bold mb-6 text-center text-blue-400">AI Detector & Humanizer</h1>
         
@@ -56,6 +69,32 @@
     </div>
 
     <script>
+        window.onload = async () => {
+            const resp = await fetch('/check-config');
+            const data = await resp.json();
+            if (!data.has_api_key) {
+                document.getElementById('apiKeyModal').classList.remove('hidden');
+            }
+        };
+
+        async function saveApiKey() {
+            const key = document.getElementById('apiKeyInput').value;
+            if (!key) return alert("Please enter a key");
+            
+            const resp = await fetch('/save-api-key', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key})
+            });
+            
+            if (resp.ok) {
+                document.getElementById('apiKeyModal').classList.add('hidden');
+                addLog("API Key saved successfully.", "success");
+            } else {
+                alert("Failed to save key.");
+            }
+        }
+
         function addLog(message, type = 'info') {
             const logContent = document.getElementById('logContent');
             const div = document.createElement('div');

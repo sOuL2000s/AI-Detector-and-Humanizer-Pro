@@ -109,6 +109,15 @@ To make this work, you will need a **Groq API Key** (it's the fastest and has a 
 Create a file named `main.py`. This handles the logic for both detection and humanization.
 
 ```python
+import sys
+import io
+
+# Redirect stdout and stderr to prevent crashes in windowed/noconsole mode
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -124,21 +133,31 @@ import tiktoken
 import time
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+import sys
+
+# Determine the base path for bundled files
+if getattr(sys, 'frozen', False):
+    BASE_PATH = sys._MEIPASS
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+# Load environment variables from .env file in the current working directory (not bundled)
+ENV_PATH = os.path.join(os.getcwd(), ".env")
+load_dotenv(ENV_PATH)
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_NAME = "llama-3.3-70b-versatile"
 CONTEXT_WINDOW = 128000 
-# Max tokens per chunk to stay under Groq's free tier TPM limits (e.g., 12,000)
-# We use 4,000 to leave room for the system prompt and the model's generated response.
 CHUNK_TOKEN_LIMIT = 4000 
 
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
+def get_groq_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    return Groq(api_key=key)
 
-client = Groq(api_key=GROQ_API_KEY)
+client = get_groq_client()
 
 app = FastAPI(title="AI Detector & Humanizer API")
 
@@ -353,12 +372,42 @@ async def extract_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading PDF: {str(e)}")
 
+@app.post("/save-api-key")
+async def save_api_key(request: dict):
+    key = request.get("key")
+    if not key:
+        raise HTTPException(status_code=400, detail="Key is required")
+    
+    with open(ENV_PATH, "w") as f:
+        f.write(f"GROQ_API_KEY={key}")
+    
+    # Reload env and client
+    load_dotenv(ENV_PATH, override=True)
+    global client
+    client = get_groq_client()
+    return {"status": "success"}
+
+@app.get("/check-config")
+async def check_config():
+    return {
+        "has_api_key": os.getenv("GROQ_API_KEY") is not None,
+        "env_location": ENV_PATH
+    }
+
 @app.get("/")
 async def serve_index():
-    return FileResponse("index.html")
+    index_path = os.path.join(BASE_PATH, "index.html")
+    return FileResponse(index_path)
 
 if __name__ == "__main__":
-    # Changed host to 127.0.0.1 for local access compatibility
+    import webbrowser
+    from threading import Timer
+
+    def open_browser():
+        webbrowser.open("http://127.0.0.1:8000")
+
+    # Start browser after a short delay to ensure server is up
+    Timer(1.5, open_browser).start()
     uvicorn.run(app, host="127.0.0.1", port=8000)
 ```
 
@@ -377,6 +426,19 @@ Create a file named `index.html`. This provides a clean interface.
     <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-10">
+    <!-- API Key Overlay -->
+    <div id="apiKeyModal" class="hidden fixed inset-0 bg-black bg-opacity-80 z-50 flex items-center justify-center p-4">
+        <div class="bg-gray-800 border border-gray-700 p-8 rounded-xl max-w-md w-full">
+            <h2 class="text-2xl font-bold text-blue-400 mb-4">Setup Groq API Key</h2>
+            <p class="text-gray-400 mb-6 text-sm">To use the Humanizer, you need a free Groq API key. Your data stays on your machine.</p>
+            <input type="password" id="apiKeyInput" class="w-full p-3 bg-gray-900 border border-gray-700 rounded mb-4 focus:ring-2 focus:ring-blue-500 outline-none" placeholder="gsk_...">
+            <div class="flex flex-col gap-3">
+                <button onclick="saveApiKey()" class="w-full bg-blue-600 hover:bg-blue-700 py-3 rounded-lg font-bold transition">Save Key</button>
+                <a href="https://console.groq.com/keys" target="_blank" class="text-center text-sm text-gray-400 hover:text-white underline">Don't have a key? Create one here (Groq Official)</a>
+            </div>
+        </div>
+    </div>
+
     <div class="max-w-4xl mx-auto">
         <h1 class="text-4xl font-bold mb-6 text-center text-blue-400">AI Detector & Humanizer</h1>
         
@@ -426,6 +488,32 @@ Create a file named `index.html`. This provides a clean interface.
     </div>
 
     <script>
+        window.onload = async () => {
+            const resp = await fetch('/check-config');
+            const data = await resp.json();
+            if (!data.has_api_key) {
+                document.getElementById('apiKeyModal').classList.remove('hidden');
+            }
+        };
+
+        async function saveApiKey() {
+            const key = document.getElementById('apiKeyInput').value;
+            if (!key) return alert("Please enter a key");
+            
+            const resp = await fetch('/save-api-key', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({key})
+            });
+            
+            if (resp.ok) {
+                document.getElementById('apiKeyModal').classList.add('hidden');
+                addLog("API Key saved successfully.", "success");
+            } else {
+                alert("Failed to save key.");
+            }
+        }
+
         function addLog(message, type = 'info') {
             const logContent = document.getElementById('logContent');
             const div = document.createElement('div');

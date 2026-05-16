@@ -1,3 +1,12 @@
+import sys
+import io
+
+# Redirect stdout and stderr to prevent crashes in windowed/noconsole mode
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,21 +22,31 @@ import tiktoken
 import time
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+import sys
+
+# Determine the base path for bundled files
+if getattr(sys, 'frozen', False):
+    BASE_PATH = sys._MEIPASS
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+# Load environment variables from .env file in the current working directory (not bundled)
+ENV_PATH = os.path.join(os.getcwd(), ".env")
+load_dotenv(ENV_PATH)
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 MODEL_NAME = "llama-3.3-70b-versatile"
 CONTEXT_WINDOW = 128000 
-# Max tokens per chunk to stay under Groq's free tier TPM limits (e.g., 12,000)
-# We use 4,000 to leave room for the system prompt and the model's generated response.
 CHUNK_TOKEN_LIMIT = 4000 
 
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY not found in environment variables. Please check your .env file.")
+def get_groq_client():
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    return Groq(api_key=key)
 
-client = Groq(api_key=GROQ_API_KEY)
+client = get_groq_client()
 
 app = FastAPI(title="AI Detector & Humanizer API")
 
@@ -242,10 +261,40 @@ async def extract_pdf(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error reading PDF: {str(e)}")
 
+@app.post("/save-api-key")
+async def save_api_key(request: dict):
+    key = request.get("key")
+    if not key:
+        raise HTTPException(status_code=400, detail="Key is required")
+    
+    with open(ENV_PATH, "w") as f:
+        f.write(f"GROQ_API_KEY={key}")
+    
+    # Reload env and client
+    load_dotenv(ENV_PATH, override=True)
+    global client
+    client = get_groq_client()
+    return {"status": "success"}
+
+@app.get("/check-config")
+async def check_config():
+    return {
+        "has_api_key": os.getenv("GROQ_API_KEY") is not None,
+        "env_location": ENV_PATH
+    }
+
 @app.get("/")
 async def serve_index():
-    return FileResponse("index.html")
+    index_path = os.path.join(BASE_PATH, "index.html")
+    return FileResponse(index_path)
 
 if __name__ == "__main__":
-    # Changed host to 127.0.0.1 for local access compatibility
+    import webbrowser
+    from threading import Timer
+
+    def open_browser():
+        webbrowser.open("http://127.0.0.1:8000")
+
+    # Start browser after a short delay to ensure server is up
+    Timer(1.5, open_browser).start()
     uvicorn.run(app, host="127.0.0.1", port=8000)

@@ -7,3 +7,4 @@ python-dotenv
 pypdf
 python-multipart
 tiktoken
+pyinstaller

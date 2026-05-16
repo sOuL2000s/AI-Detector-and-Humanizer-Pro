@@ -1,0 +1,16 @@
+How to build your lightweight EXE:
+
+1. Install PyInstaller:
+   pip install pyinstaller
+
+2. Run the build script:
+   python build_exe.py
+
+3. Find your EXE:
+   Go to the "dist" folder. You will see "AI_Humanizer_Pro.exe".
+
+What happens when a user runs the EXE:
+1. It opens the app in their default browser automatically.
+2. On first "Detect AI" click, the RoBERTa model (~500MB) will download into their local cache folder.
+3. If they don't have a .env file with an API key, a screen pops up asking for one with a link to Groq.
+4. The EXE is lightweight because it doesn't contain the AI model weights; it only contains the Python environment and your code.
