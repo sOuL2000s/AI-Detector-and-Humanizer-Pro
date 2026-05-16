@@ -62,7 +62,7 @@ def humanize_logic(text: str):
     
     # 1st Pass Humanization
     completion = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": text}
@@ -78,7 +78,7 @@ def humanize_logic(text: str):
     # If score is still high (>30%), do one more aggressive pass
     if score > 30:
         completion = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": "The previous attempt still looks like AI. Rewrite this again. Be more creative, change sentence lengths more drastically, and use less predictable vocabulary."},
                 {"role": "user", "content": humanized_text}

@@ -13,26 +13,70 @@
         <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
             <!-- Input Area -->
             <div>
-                <label class="block mb-2 font-semibold">Input AI Text:</label>
+                <div class="flex justify-between items-center mb-2">
+                    <label class="font-semibold">Input AI Text:</label>
+                    <div class="space-x-2">
+                        <button onclick="pasteText()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">Paste</button>
+                        <label class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded cursor-pointer">
+                            Import File
+                            <input type="file" id="fileInput" class="hidden" accept=".txt,.md" onchange="importFile(this)">
+                        </label>
+                    </div>
+                </div>
                 <textarea id="inputText" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500" placeholder="Paste your AI content here..."></textarea>
                 <div class="mt-4 space-x-2">
                     <button onclick="process('detect')" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold">Detect AI</button>
                     <button onclick="process('humanize')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-bold text-white">Humanize Text</button>
+                    <button onclick="document.getElementById('inputText').value = ''" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-bold">Clear</button>
                 </div>
             </div>
 
             <!-- Output Area -->
             <div>
-                <label class="block mb-2 font-semibold">Results:</label>
-                <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto">
+                <div class="flex justify-between items-center mb-2">
+                    <label class="font-semibold">Results:</label>
+                    <button onclick="copyResults()" class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded">Copy Result</button>
+                </div>
+                <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto relative">
                     <p id="scoreText" class="text-xl font-bold text-yellow-400 mb-2"></p>
-                    <p id="outputText" class="text-gray-300"></p>
+                    <p id="outputText" class="text-gray-300 whitespace-pre-wrap"></p>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
+        async function pasteText() {
+            try {
+                const text = await navigator.clipboard.readText();
+                document.getElementById('inputText').value = text;
+            } catch (err) {
+                alert("Could not paste from clipboard. Please paste manually.");
+            }
+        }
+
+        function importFile(input) {
+            const file = input.files[0];
+            if (!file) return;
+            
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                document.getElementById('inputText').value = e.target.result;
+            };
+            reader.readAsText(file);
+        }
+
+        async function copyResults() {
+            const text = document.getElementById('outputText').innerText;
+            if (!text) return;
+            try {
+                await navigator.clipboard.writeText(text);
+                alert("Results copied to clipboard!");
+            } catch (err) {
+                alert("Failed to copy.");
+            }
+        }
+
         async function process(type) {
             const text = document.getElementById('inputText').value;
             const scoreDisplay = document.getElementById('scoreText');
@@ -44,7 +88,6 @@
             outputDisplay.innerText = "";
 
             try {
-                // Use relative path so it works regardless of host
                 const response = await fetch(`/${type}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
