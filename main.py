@@ -24,6 +24,9 @@ import pypdf
 import tiktoken
 import time
 import re
+import sqlite3
+import hashlib
+import asyncio
 from dotenv import load_dotenv
 
 import sys
@@ -40,6 +43,8 @@ load_dotenv(ENV_PATH)
 
 # --- CONFIGURATION ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+LOG_DATA_FOR_FINETUNING = True # Toggle for dataset collection
+DATASET_FILE = os.path.join(os.getcwd(), "fine_tuning_dataset.jsonl")
 MODEL_NAME = "llama-3.3-70b-versatile"
 CONTEXT_WINDOW = 128000 
 CHUNK_TOKEN_LIMIT = 4000 
@@ -53,6 +58,54 @@ def get_groq_client():
 client = get_groq_client()
 
 app = FastAPI(title="AI Detector & Humanizer API")
+
+# --- CACHE SETUP ---
+CACHE_DB = os.path.join(os.getcwd(), "app_cache.db")
+
+def init_db():
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS cache 
+                 (key TEXT PRIMARY KEY, value TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def get_cache(key_str: str):
+    key = hashlib.sha256(key_str.encode()).hexdigest()
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute("SELECT value FROM cache WHERE key=?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else None
+
+def log_for_finetuning(original: str, humanized: str, tone: str, permission: bool = True):
+    """Logs successful humanizations for future fine-tuning dataset creation."""
+    if not LOG_DATA_FOR_FINETUNING or not permission:
+        return
+    
+    try:
+        data = {
+            "instruction": f"Rewrite the following text in a {tone} human-like tone.",
+            "input": original,
+            "output": humanized,
+            "timestamp": time.time()
+        }
+        with open(DATASET_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data) + "\n")
+    except Exception as e:
+        print(f"Error logging dataset: {e}")
+
+def set_cache(key_str: str, value: dict):
+    key = hashlib.sha256(key_str.encode()).hexdigest()
+    conn = sqlite3.connect(CACHE_DB)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO cache (key, value) VALUES (?, ?)", 
+              (key, json.dumps(value)))
+    conn.commit()
+    conn.close()
 
 # Enable CORS for frontend communication
 app.add_middleware(
@@ -116,6 +169,8 @@ if torch.cuda.is_available():
 
 class TextRequest(BaseModel):
     text: str
+    tone: str = "balanced"
+    allow_logging: bool = True
 
 def count_tokens(text: str):
     """Accurately count tokens using tiktoken (cl100k_base is used as a proxy for Llama 3)."""
@@ -201,15 +256,9 @@ def get_ai_fingerprint_score(text: str):
     norm_score = max(0, min(100, density * 120))
     return norm_score
 
-def get_ai_score(text: str):
+def get_ai_detailed_report(text: str):
     """
-    Returns the ensemble probability of the text being AI-generated.
-    Weighted Calculation: 
-    - 30% DeBERTa (Neural)
-    - 25% Binoculars (Predictability)
-    - 15% Perplexity (Randomness)
-    - 15% Burstiness (Sentence Length Variance)
-    - 15% Fingerprints (Vocabulary Patterns)
+    Returns the ensemble probability and a detailed reasoning for the score.
     """
     # 1. DeBERTa Neural Classification (30%)
     inputs = classifier_tokenizer(text[:1500], return_tensors="pt", truncation=True, max_length=512)
@@ -247,7 +296,90 @@ def get_ai_score(text: str):
         (fingerprint_score * 0.15)
     )
     
-    return round(final_score, 2)
+    reasoning = []
+    if deberta_score > 50: reasoning.append("Neural patterns highly resemble AI structures.")
+    if binoculars_score > 50: reasoning.append("Token distribution is highly predictable (low entropy).")
+    if perplexity_score > 50: reasoning.append("Low perplexity indicates robotic word choice.")
+    if burstiness_score > 50: reasoning.append("Low burstiness; sentence structures are too uniform.")
+    if fingerprint_score > 50: reasoning.append("Detected density of common LLM vocabulary/fingerprints.")
+
+    return round(final_score, 2), " ".join(reasoning)
+
+def get_ai_score(text: str):
+    cache_key = f"detect:{text}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached['score']
+    
+    score, _ = get_ai_detailed_report(text)
+    set_cache(cache_key, {'score': score})
+    return score
+
+TONE_PROMPTS = {
+    "balanced": (
+        "Rewrite the following text to make it indistinguishable from human writing. "
+        "Use varying sentence structures (burstiness), natural idioms, and a conversational flow. "
+        "Ensure it passes AI detection while maintaining the original meaning. "
+        "Avoid over-used AI words like 'delve', 'meticulous', and 'comprehensive'. "
+        "CRITICAL: Preserve all Markdown formatting exactly (tables, bold text, bullet points, headers)."
+    ),
+    "creative": (
+        "Rewrite this text with a strong creative flair. Inject minor grammatical imperfections, "
+        "use contractions, and vary sentence structures drastically. Use active voice, narrative hooks, "
+        "and expressive vocabulary. Make it feel like a personal story or a blog post. "
+        "CRITICAL: Preserve all Markdown formatting exactly (tables, bold text, bullet points, headers)."
+    ),
+    "academic": (
+        "Rewrite this text in a formal academic tone but ensure it lacks the robotic predictability "
+        "of AI. Use precise terminology, sophisticated syntax, and objective reasoning. "
+        "Vary sentence lengths to avoid 'rhythmic' AI patterns. Ensure clarity and rigor. "
+        "CRITICAL: Preserve all Markdown formatting exactly (tables, bold text, bullet points, headers)."
+    ),
+    "high-school": (
+        "Rewrite this text as if written by a bright high school student. Use simpler vocabulary, "
+        "occasional informal transitions, and a straightforward perspective. Avoid overly complex "
+        "jargon. It should sound genuine, slightly unpolished, but coherent. "
+        "CRITICAL: Preserve all Markdown formatting exactly (tables, bold text, bullet points, headers)."
+    ),
+    "journalistic": (
+        "Rewrite this text in a professional journalistic style. Focus on facts, use a clear "
+        "inverted pyramid structure, and short, punchy paragraphs. Use direct quotes where appropriate "
+        "and maintain a neutral but engaging reporting voice. "
+        "CRITICAL: Preserve all Markdown formatting exactly (tables, bold text, bullet points, headers)."
+    )
+}
+
+def extract_entities(text: str):
+    """Simple extraction of numbers, dates, and potential names (capitalized words)."""
+    # Numbers and basic dates
+    numbers = set(re.findall(r'\b\d+(?:[.,]\d+)*\b', text))
+    # Capitalized words (potential names/proper nouns)
+    names = set(re.findall(r'\b[A-Z][a-z]+\b', text))
+    return {"numbers": numbers, "names": names}
+
+def verify_facts(original: str, humanized: str):
+    """Compares entities to find potential hallucinations or omissions."""
+    orig_entities = extract_entities(original)
+    hum_entities = extract_entities(humanized)
+    
+    issues = []
+    
+    missing_numbers = orig_entities["numbers"] - hum_entities["numbers"]
+    added_numbers = hum_entities["numbers"] - orig_entities["numbers"]
+    
+    if missing_numbers:
+        issues.append(f"Missing numbers: {', '.join(list(missing_numbers)[:5])}")
+    if added_numbers:
+        issues.append(f"New numbers detected (hallucination risk): {', '.join(list(added_numbers)[:5])}")
+        
+    missing_names = orig_entities["names"] - hum_entities["names"]
+    if missing_names:
+        # Filter out common capitalized words that might just be start of sentences
+        filtered_missing = [n for n in missing_names if n.lower() not in ["the", "a", "an", "this", "that", "it"]]
+        if filtered_missing:
+            issues.append(f"Missing names/proper nouns: {', '.join(filtered_missing[:5])}")
+            
+    return issues
 
 def chunk_text_by_tokens(text: str, max_tokens: int):
     """Splits text into chunks based on token counts."""
@@ -259,8 +391,8 @@ def chunk_text_by_tokens(text: str, max_tokens: int):
         chunks.append(encoding.decode(chunk_tokens))
     return chunks
 
-def humanize_logic(text: str):
-    """The 'Secret Sauce' Humanizer Loop with automatic chunking for rate-limit safety."""
+async def humanize_logic(text: str):
+    """The 'Secret Sauce' Humanizer Loop with parallel chunk processing."""
     system_prompt = (
         "Rewrite the following text to make it indistinguishable from human writing. "
         "Use varying sentence structures (burstiness), natural idioms, and a conversational flow. "
@@ -271,46 +403,69 @@ def humanize_logic(text: str):
     token_count = count_tokens(text)
     
     if token_count <= CHUNK_TOKEN_LIMIT:
-        return _process_chunk(text, system_prompt)
+        return await _process_chunk(text, system_prompt)
     
-    print(f"Large text detected ({token_count} tokens). Processing in chunks...")
+    print(f"Large text detected ({token_count} tokens). Processing chunks in parallel...")
     chunks = chunk_text_by_tokens(text, CHUNK_TOKEN_LIMIT)
-    humanized_chunks = []
     
-    for i, chunk in enumerate(chunks):
-        print(f"Humanizing chunk {i+1}/{len(chunks)}...")
-        humanized_chunks.append(_process_chunk(chunk, system_prompt))
-        # Small sleep to help avoid hitting RPM (Requests Per Minute) limits
-        if i < len(chunks) - 1:
-            time.sleep(1.5)
+    # Process chunks in parallel using asyncio.gather
+    tasks = [_process_chunk(chunk, system_prompt) for chunk in chunks]
+    humanized_chunks = await asyncio.gather(*tasks)
             
     return "\n\n".join(humanized_chunks)
 
-def _process_chunk(chunk_text: str, system_prompt: str):
-    """Internal helper to humanize individual segments."""
+async def _process_chunk(chunk_text: str, system_prompt: str):
+    """Internal helper with a verification loop and caching."""
+    # Cache check
+    cache_key = f"humanize:{system_prompt}:{chunk_text}"
+    cached = get_cache(cache_key)
+    if isinstance(cached, str):
+        return cached
+
+    max_retries = 3
+    target_threshold = 5.0
+    current_text = chunk_text
+    
     try:
-        completion = client.chat.completions.create(
+        # Initial Humanization
+        completion = await asyncio.to_thread(
+            client.chat.completions.create,
             model=MODEL_NAME,
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": chunk_text}
+                {"role": "user", "content": current_text}
             ],
-            temperature=0.8,
+            temperature=0.8
         )
-        humanized = completion.choices[0].message.content
-        
-        # Quick verification/re-pass if score is still high
-        if get_ai_score(humanized) > 30:
-            completion = client.chat.completions.create(
+        current_text = completion.choices[0].message.content
+
+        # Verification Loop
+        for i in range(max_retries):
+            score, reasoning = get_ai_detailed_report(current_text)
+            
+            if score < target_threshold:
+                break
+                
+            feedback = f"The previous output was flagged with an AI probability of {score}%. "
+            if reasoning:
+                feedback += f"Issues identified: {reasoning} "
+            feedback += "Please rewrite the text to be more human-like. Increase sentence length variation (burstiness) and use more natural, unpredictable word choices."
+
+            completion = await asyncio.to_thread(
+                client.chat.completions.create,
                 model=MODEL_NAME,
                 messages=[
-                    {"role": "system", "content": "The previous attempt still looks like AI. Rewrite more creatively with varied sentence lengths."},
-                    {"role": "user", "content": humanized}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": chunk_text}, # Pass original context
+                    {"role": "assistant", "content": current_text},
+                    {"role": "user", "content": feedback}
                 ],
-                temperature=0.9,
+                temperature=0.85 + (i * 0.05)
             )
-            humanized = completion.choices[0].message.content
-        return humanized
+            current_text = completion.choices[0].message.content
+
+        set_cache(cache_key, current_text)
+        return current_text
     except Exception as e:
         if "rate_limit_exceeded" in str(e).lower():
             raise HTTPException(status_code=429, detail="API Rate Limit Exceeded. Please try a smaller text or wait a minute.")
@@ -318,6 +473,15 @@ def _process_chunk(chunk_text: str, system_prompt: str):
 
 async def stream_detection(text: str):
     try:
+        cache_key = f"full_detect:{text}"
+        cached = get_cache(cache_key)
+        if cached:
+            yield json.dumps({"log": "Retrieving results from cache...", "log_type": "success"}) + "\n"
+            yield json.dumps({
+                "final_result": cached['final_result']
+            }) + "\n"
+            return
+
         yield json.dumps({"log": "Initializing Ensemble Detection Engine...", "log_type": "process"}) + "\n"
         
         # Calculate sub-scores for detailed logging
@@ -339,8 +503,10 @@ async def stream_detection(text: str):
         yield json.dumps({"log": f"Final Weighted Confidence: {score}%", "log_type": "info"}) + "\n"
         
         status = "AI" if score > 50 else "Human"
+        result_data = {"ai_probability": f"{score}%", "status": status}
+        set_cache(cache_key, {"final_result": result_data})
         yield json.dumps({
-            "final_result": {"ai_probability": f"{score}%", "status": status}
+            "final_result": result_data
         }) + "\n"
     except Exception as e:
         yield json.dumps({"error": str(e)}) + "\n"
@@ -351,43 +517,91 @@ async def detect(request: TextRequest):
         raise HTTPException(status_code=400, detail="No text provided")
     return StreamingResponse(stream_detection(request.text), media_type="application/x-ndjson")
 
-async def stream_humanization(text: str):
+async def stream_humanization(text: str, tone: str = "balanced", allow_logging: bool = True):
     try:
-        system_prompt = (
-            "Rewrite the following text to make it indistinguishable from human writing. "
-            "Use varying sentence structures (burstiness), natural idioms, and a conversational flow. "
-            "Ensure it passes AI detection while maintaining the original meaning and professional quality. "
-            "Avoid over-used AI words like 'delve', 'meticulous', and 'comprehensive'."
-        )
+        system_prompt = TONE_PROMPTS.get(tone, TONE_PROMPTS["balanced"])
+        yield json.dumps({"log": f"Selected Tone: {tone.capitalize()}", "log_type": "info"}) + "\n"
         
         token_count = count_tokens(text)
         yield json.dumps({"log": f"Input analysis: {token_count} tokens detected.", "log_type": "info"}) + "\n"
         
-        if token_count <= CHUNK_TOKEN_LIMIT:
-            yield json.dumps({"log": "Processing single segment...", "log_type": "process"}) + "\n"
-            humanized = _process_chunk(text, system_prompt)
-            yield json.dumps({"log": "Applying secondary verification pass...", "log_type": "process"}) + "\n"
-        else:
-            yield json.dumps({"log": f"Large text detected. Splitting into chunks...", "log_type": "warning"}) + "\n"
-            chunks = chunk_text_by_tokens(text, CHUNK_TOKEN_LIMIT)
-            humanized_chunks = []
+        # Sentence-Level Surgical Humanization Strategy
+        yield json.dumps({"log": "Analyzing sentence-level patterns...", "log_type": "process"}) + "\n"
+        
+        # Simple sentence splitter
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if len(sentences) > 4:
+            yield json.dumps({"log": f"Identifying most robotic segments among {len(sentences)} sentences...", "log_type": "info"}) + "\n"
             
-            for i, chunk in enumerate(chunks):
-                yield json.dumps({"log": f"Humanizing chunk {i+1} of {len(chunks)}...", "log_type": "process"}) + "\n"
-                humanized_chunks.append(_process_chunk(chunk, system_prompt))
-                if i < len(chunks) - 1:
-                    yield json.dumps({"log": "Cooling down for rate limit safety...", "log_type": "info"}) + "\n"
-                    time.sleep(1.5)
-            humanized = "\n\n".join(humanized_chunks)
+            sentence_scores = []
+            for i, s in enumerate(sentences):
+                if not s.strip() or len(s.strip()) < 15: continue 
+                score = get_ai_score(s)
+                sentence_scores.append({"index": i, "text": s, "score": score})
+            
+            # Sort by highest AI score
+            sentence_scores.sort(key=lambda x: x["score"], reverse=True)
+            
+            # Pick top segments to rewrite
+            # Limit to 3 sentences or roughly 25% of the text to preserve human parts
+            num_to_rewrite = max(1, min(3, len(sentence_scores) // 2))
+            targets_to_rewrite = sentence_scores[:num_to_rewrite]
+            target_indices = {item["index"] for item in targets_to_rewrite}
+            
+            yield json.dumps({"log": f"Targeting {len(target_indices)} specific robotic segments for rewriting.", "log_type": "warning"}) + "\n"
+            
+            humanized_sentences = list(sentences)
+            tasks = []
+            target_info = []
+
+            for item in targets_to_rewrite:
+                idx = item["index"]
+                orig_s = item["text"]
+                yield json.dumps({"log": f"Queuing segment {idx+1} for parallel rewrite (Score: {item['score']}%)", "log_type": "process"}) + "\n"
+                
+                # Contextual prompt for surgical rewrite
+                context_hint = " Context: " + (" ".join(sentences[max(0, idx-1):idx+2]))
+                sentence_prompt = system_prompt + " Rewrite ONLY the target sentence provided below. Preserve its surrounding meaning." + context_hint[:200]
+                
+                tasks.append(_process_chunk(orig_s, sentence_prompt))
+                target_info.append(idx)
+
+            # Parallel Execution
+            results = await asyncio.gather(*tasks)
+            for i, result in enumerate(results):
+                humanized_sentences[target_info[i]] = result
+            
+            humanized = " ".join(humanized_sentences)
+        else:
+            # Fallback to full block rewrite for short texts
+            yield json.dumps({"log": "Text too short for surgical precision. Rewriting block...", "log_type": "process"}) + "\n"
+            humanized = await _process_chunk(text, system_prompt)
+
+        yield json.dumps({"log": "Running Fact-Preservation check...", "log_type": "process"}) + "\n"
+        fact_issues = verify_facts(text, humanized)
+        if fact_issues:
+            for issue in fact_issues:
+                yield json.dumps({"log": f"Data Integrity Warning: {issue}", "log_type": "warning"}) + "\n"
+        else:
+            yield json.dumps({"log": "Fact check passed: All numbers and names preserved.", "log_type": "success"}) + "\n"
 
         yield json.dumps({"log": "Calculating final AI score...", "log_type": "process"}) + "\n"
         new_score = get_ai_score(humanized)
         
+        # Log for continuous learning if permission is granted and result is "successful" (< 20% AI)
+        try:
+            score_val = float(new_score.strip('%'))
+            if score_val < 20:
+                log_for_finetuning(text, humanized, tone, allow_logging)
+        except:
+            pass
+
         yield json.dumps({
             "final_result": {
                 "original_text": text,
                 "humanized_text": humanized,
-                "new_ai_score": f"{new_score}%"
+                "new_ai_score": f"{new_score}%",
+                "fact_issues": fact_issues
             }
         }) + "\n"
     except Exception as e:
@@ -400,7 +614,7 @@ async def stream_humanization(text: str):
 async def humanize(request: TextRequest):
     if not request.text:
         raise HTTPException(status_code=400, detail="No text provided")
-    return StreamingResponse(stream_humanization(request.text), media_type="application/x-ndjson")
+    return StreamingResponse(stream_humanization(request.text, request.tone, request.allow_logging), media_type="application/x-ndjson")
 
 @app.post("/count-tokens")
 async def get_token_count(request: TextRequest):
@@ -459,6 +673,49 @@ async def check_config():
         "has_api_key": os.getenv("GROQ_API_KEY") is not None,
         "env_location": ENV_PATH
     }
+
+@app.post("/analyze")
+async def analyze_full(request: TextRequest):
+    """Provides a detailed breakdown of AI characteristics and sentence-level heatmap."""
+    text = request.text
+    if not text:
+        raise HTTPException(status_code=400, detail="No text provided")
+    
+    cache_key = f"analyze:{text}"
+    cached = get_cache(cache_key)
+    if cached:
+        return cached
+
+    # Feature scores for "Why is this AI?" breakdown
+    ppl = get_perplexity(text[:1000])
+    bino = get_binoculars_score(text[:1000])
+    burst = get_burstiness_score(text)
+    fing = get_ai_fingerprint_score(text)
+    final_score, reasoning = get_ai_detailed_report(text)
+    
+    # Sentence splitting for heatmap
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    heatmap = []
+    for s in sentences:
+        if not s.strip() or len(s.strip()) < 5: 
+            if s.strip(): heatmap.append({"text": s, "score": 0})
+            continue
+        s_score = get_ai_score(s)
+        heatmap.append({"text": s, "score": s_score})
+        
+    response_data = {
+        "final_score": final_score,
+        "metrics": {
+            "Perplexity (Randomness)": f"{round(100 - ppl, 1)}%",
+            "Predictability (Entropy)": f"{round(bino, 1)}%",
+            "Uniformity (Burstiness)": f"{round(burst, 1)}%",
+            "AI Vocabulary Density": f"{round(fing, 1)}%"
+        },
+        "reasoning": reasoning,
+        "heatmap": heatmap
+    }
+    set_cache(cache_key, response_data)
+    return response_data
 
 @app.get("/")
 async def serve_index():

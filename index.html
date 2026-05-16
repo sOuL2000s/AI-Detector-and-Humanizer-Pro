@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AI Humanizer Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/diff-match-patch/1.0.5/index.min.js"></script>
+    <style>
+        ins { background-color: #064e3b; text-decoration: none; color: #34d399; }
+        del { background-color: #7f1d1d; text-decoration: line-through; color: #f87171; }
+    </style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen p-10">
     <!-- API Key Overlay -->
@@ -41,10 +46,26 @@
                     <span id="charCount">Characters: 0</span>
                     <span id="tokenEst">Tokens: 0 / 128,000</span>
                 </div>
-                <div class="mt-4 space-x-2">
-                    <button onclick="process('detect')" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold">Detect AI</button>
-                    <button onclick="process('humanize')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-bold text-white">Humanize Text</button>
-                    <button onclick="document.getElementById('inputText').value = ''" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-bold">Clear</button>
+                <div class="mt-4 space-y-3">
+                    <div class="flex items-center space-x-2">
+                        <label class="text-xs text-gray-400">Tone Profile:</label>
+                        <select id="toneSelect" class="bg-gray-800 border border-gray-700 rounded text-xs p-1 focus:ring-1 focus:ring-blue-500 outline-none">
+                            <option value="balanced">Balanced (Default)</option>
+                            <option value="creative">Creative / Narrative</option>
+                            <option value="academic">Academic / Formal</option>
+                            <option value="high-school">High School Student</option>
+                            <option value="journalistic">Journalistic / News</option>
+                        </select>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <input type="checkbox" id="loggingConsent" checked class="w-3 h-3 bg-gray-800 border-gray-700 rounded text-blue-600 focus:ring-blue-500">
+                        <label for="loggingConsent" class="text-[10px] text-gray-500">Allow logging for continuous learning (helps improve the model)</label>
+                    </div>
+                    <div class="space-x-2">
+                        <button onclick="process('detect')" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold">Detect AI</button>
+                        <button onclick="process('humanize')" class="bg-green-600 hover:bg-green-700 px-6 py-2 rounded-lg font-bold text-white">Humanize Text</button>
+                        <button onclick="document.getElementById('inputText').value = ''" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-bold">Clear</button>
+                    </div>
                 </div>
             </div>
 
@@ -56,7 +77,19 @@
                 </div>
                 <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto relative mb-4">
                     <p id="scoreText" class="text-xl font-bold text-yellow-400 mb-2"></p>
+                    
+                    <div id="factWarning" class="hidden mb-4 p-2 bg-yellow-900/30 border border-yellow-700 rounded text-xs text-yellow-200"></div>
+
+                    <!-- Metrics Breakdown -->
+                    <div id="metricsGrid" class="hidden grid grid-cols-2 gap-2 mb-4"></div>
+                    
+                    <!-- Heatmap / Text Content -->
+                    <div id="heatmapContent" class="hidden mb-4 text-sm leading-relaxed"></div>
+                    
                     <p id="outputText" class="text-gray-300 whitespace-pre-wrap"></p>
+                    
+                    <!-- Diff View -->
+                    <div id="diffView" class="hidden p-3 bg-gray-900 rounded text-sm whitespace-pre-wrap border border-gray-700"></div>
                 </div>
 
                 <!-- Log Area -->
@@ -207,10 +240,66 @@
             }
         }
 
+        async function runDetailedAnalysis(text) {
+            addLog("Generating heatmap and feature breakdown...", "process");
+            const resp = await fetch('/analyze', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({text})
+            });
+            const data = await resp.json();
+
+            // Display Metrics
+            const grid = document.getElementById('metricsGrid');
+            grid.innerHTML = '';
+            grid.classList.remove('hidden');
+            for (const [key, val] of Object.entries(data.metrics)) {
+                grid.innerHTML += `
+                    <div class="bg-gray-700 p-2 rounded">
+                        <div class="text-[10px] text-gray-400 uppercase font-bold">${key}</div>
+                        <div class="text-sm font-mono text-blue-300">${val}</div>
+                    </div>
+                `;
+            }
+
+            // Display Heatmap
+            const heatmap = document.getElementById('heatmapContent');
+            heatmap.innerHTML = '<div class="text-xs text-gray-500 mb-2 border-b border-gray-700 pb-1 uppercase font-bold">AI Probability Heatmap:</div>';
+            heatmap.classList.remove('hidden');
+            data.heatmap.forEach(seg => {
+                let color = 'text-green-400';
+                let bg = 'bg-transparent';
+                if (seg.score > 80) { color = 'text-white'; bg = 'bg-red-900/60'; }
+                else if (seg.score > 40) { color = 'text-white'; bg = 'bg-yellow-900/40'; }
+                
+                heatmap.innerHTML += `<span class="${color} ${bg} px-0.5 rounded transition-colors duration-500" title="Score: ${seg.score}%">${seg.text} </span>`;
+            });
+            
+            document.getElementById('outputText').classList.add('hidden');
+        }
+
+        function showDiff(oldText, newText) {
+            const diffContainer = document.getElementById('diffView');
+            diffContainer.innerHTML = '<div class="text-xs text-gray-500 mb-2 border-b border-gray-700 pb-1 uppercase font-bold">Changes Made (Diff):</div>';
+            diffContainer.classList.remove('hidden');
+            
+            const dmp = new diff_match_patch();
+            const diffs = dmp.diff_main(oldText, newText);
+            dmp.diff_cleanupSemantic(diffs);
+            diffContainer.innerHTML += dmp.diff_prettyHtml(diffs);
+        }
+
         async function process(type) {
             const text = document.getElementById('inputText').value;
             const scoreDisplay = document.getElementById('scoreText');
             const outputDisplay = document.getElementById('outputText');
+            
+            // UI Reset
+            document.getElementById('metricsGrid').classList.add('hidden');
+            document.getElementById('heatmapContent').classList.add('hidden');
+            document.getElementById('diffView').classList.add('hidden');
+            document.getElementById('factWarning').classList.add('hidden');
+            outputDisplay.classList.remove('hidden');
 
             if (!text) return alert("Please enter text");
 
@@ -220,10 +309,16 @@
             addLog(`Initializing ${type} engine...`, 'process');
 
             try {
+                const tone = document.getElementById('toneSelect').value;
+                const consent = document.getElementById('loggingConsent').checked;
                 const response = await fetch(`/${type}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ text: text })
+                    body: JSON.stringify({ 
+                        text: text,
+                        tone: type === 'humanize' ? tone : undefined,
+                        allow_logging: consent
+                    })
                 });
 
                 if (!response.body) {
@@ -257,10 +352,25 @@
                                     scoreDisplay.innerText = `AI Probability: ${res.ai_probability}`;
                                     outputDisplay.innerText = `Verdict: ${res.status}`;
                                     addLog(`Detection complete. Verdict: ${res.status}`, 'success');
+                                    
+                                    // Trigger Detailed Analysis for Heatmap and Metrics
+                                    runDetailedAnalysis(text);
                                 } else {
                                     scoreDisplay.innerText = `New AI Score: ${res.new_ai_score}`;
                                     outputDisplay.innerText = res.humanized_text;
-                                    addLog(`Humanization complete. Final AI Score: ${res.new_ai_score}`, 'success');
+                                    
+                                    // Generate Diff
+                                    showDiff(text, res.humanized_text);
+
+                                    if (res.fact_issues && res.fact_issues.length > 0) {
+                                        const fw = document.getElementById('factWarning');
+                                        fw.innerHTML = "<strong>Fact Preservation Warnings:</strong><ul class='list-disc ml-4 mt-1'>" + 
+                                                       res.fact_issues.map(i => `<li>${i}</li>`).join('') + "</ul>";
+                                        fw.classList.remove('hidden');
+                                        addLog(`Humanization complete with data integrity warnings.`, 'warning');
+                                    } else {
+                                        addLog(`Humanization complete. Final AI Score: ${res.new_ai_score}`, 'success');
+                                    }
                                 }
                             }
                             
