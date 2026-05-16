@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+transformers
+torch
+groq
+python-dotenv
+pypdf
+python-multipart
+tiktoken
