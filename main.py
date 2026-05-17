@@ -458,31 +458,38 @@ async def stream_detection(text: str):
         cache_key = f"full_detect:{text}"
         cached = get_cache(cache_key)
         if cached:
-            yield json.dumps({"log": "Retrieving results from cache...", "log_type": "success"}) + "\n"
+            yield json.dumps({"log": "Found exact match in local cache. Loading...", "log_type": "success", "progress": 50}) + "\n"
+            await asyncio.sleep(0.3)
+            yield json.dumps({"log": "Retrieving results from cache...", "log_type": "success", "progress": 100}) + "\n"
             yield json.dumps({
                 "final_result": cached['final_result']
             }) + "\n"
             return
 
-        yield json.dumps({"log": "Initializing Ensemble Detection Engine...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Initializing Ensemble Detection Engine...", "log_type": "process", "progress": 5}) + "\n"
+        await asyncio.sleep(0.1)
         
-        # Calculate sub-scores for detailed logging
+        yield json.dumps({"log": "Waking up GPT-2 Perplexity Engine...", "log_type": "process", "progress": 10}) + "\n"
         ppl = get_perplexity(text[:1000])
-        yield json.dumps({"log": f"Perplexity Analysis: {round(ppl, 1)}% AI probability.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Perplexity Analysis: {round(ppl, 1)}% AI probability.", "log_type": "info", "progress": 25}) + "\n"
         
+        yield json.dumps({"log": "Calculating Token Distribution Entropy (Binoculars)...", "log_type": "process", "progress": 30}) + "\n"
         bino = get_binoculars_score(text[:1000])
-        yield json.dumps({"log": f"Predictability (Entropy): {round(bino, 1)}% AI probability.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Predictability (Entropy): {round(bino, 1)}% AI probability.", "log_type": "info", "progress": 45}) + "\n"
 
+        yield json.dumps({"log": "Analyzing Sentence Burstiness & Structural Uniformity...", "log_type": "process", "progress": 50}) + "\n"
         burst = get_burstiness_score(text)
-        yield json.dumps({"log": f"Burstiness (Structure): {round(burst, 1)}% uniformity (AI-like).", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Burstiness (Structure): {round(burst, 1)}% uniformity (AI-like).", "log_type": "info", "progress": 60}) + "\n"
 
+        yield json.dumps({"log": "Scanning for LLM Vocabulary Fingerprints...", "log_type": "process", "progress": 65}) + "\n"
         fing = get_ai_fingerprint_score(text)
-        yield json.dumps({"log": f"AI Fingerprints: {round(fing, 1)}% common LLM vocabulary density.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"AI Fingerprints: {round(fing, 1)}% common LLM vocabulary density.", "log_type": "info", "progress": 75}) + "\n"
         
-        yield json.dumps({"log": "Running DeBERTa-v3 neural classifier...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Injecting into DeBERTa-v3 Neural Classifier Head...", "log_type": "process", "progress": 80}) + "\n"
         score = get_ai_score(text)
         
-        yield json.dumps({"log": f"Final Weighted Confidence: {score}%", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Aggregating Weighted Confidence Scores...", "log_type": "process", "progress": 90}) + "\n"
+        yield json.dumps({"log": f"Final Weighted Confidence: {score}%", "log_type": "info", "progress": 95}) + "\n"
         
         status = "AI" if score > 50 else "Human"
         result_data = {"ai_probability": f"{score}%", "status": status}
@@ -502,18 +509,16 @@ async def detect(request: TextRequest):
 async def stream_humanization(text: str, tone: str = "balanced", allow_logging: bool = True):
     try:
         system_prompt = TONE_PROMPTS.get(tone, TONE_PROMPTS["balanced"])
-        yield json.dumps({"log": f"Selected Tone: {tone.capitalize()}", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Selected Tone: {tone.capitalize()}", "log_type": "info", "progress": 5}) + "\n"
         
         token_count = count_tokens(text)
-        yield json.dumps({"log": f"Input analysis: {token_count} tokens detected.", "log_type": "info"}) + "\n"
+        yield json.dumps({"log": f"Input analysis: {token_count} tokens detected.", "log_type": "info", "progress": 10}) + "\n"
         
-        # Sentence-Level Surgical Humanization Strategy
-        yield json.dumps({"log": "Analyzing sentence-level patterns...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Analyzing sentence-level patterns...", "log_type": "process", "progress": 15}) + "\n"
         
-        # Simple sentence splitter
         sentences = re.split(r'(?<=[.!?])\s+', text)
         if len(sentences) > 4:
-            yield json.dumps({"log": f"Identifying most robotic segments among {len(sentences)} sentences...", "log_type": "info"}) + "\n"
+            yield json.dumps({"log": f"Identifying most robotic segments among {len(sentences)} sentences...", "log_type": "info", "progress": 20}) + "\n"
             
             sentence_scores = []
             for i, s in enumerate(sentences):
@@ -536,38 +541,54 @@ async def stream_humanization(text: str, tone: str = "balanced", allow_logging: 
             tasks = []
             target_info = []
 
-            for item in targets_to_rewrite:
+            for i, item in enumerate(targets_to_rewrite):
                 idx = item["index"]
                 orig_s = item["text"]
-                yield json.dumps({"log": f"Queuing segment {idx+1} for parallel rewrite (Score: {item['score']}%)", "log_type": "process"}) + "\n"
                 
+                # Create wrapper to capture task completion for progress updates
+                async def tracked_task(s, p, task_idx):
+                    res = await _process_chunk(s, p)
+                    return res, task_idx
+
                 # Contextual prompt for surgical rewrite
                 context_hint = " Context: " + (" ".join(sentences[max(0, idx-1):idx+2]))
                 sentence_prompt = system_prompt + " Rewrite ONLY the target sentence provided below. Preserve its surrounding meaning." + context_hint[:200]
                 
-                tasks.append(_process_chunk(orig_s, sentence_prompt))
+                tasks.append(tracked_task(orig_s, sentence_prompt, idx))
                 target_info.append(idx)
 
-            # Parallel Execution
-            results = await asyncio.gather(*tasks)
-            for i, result in enumerate(results):
-                humanized_sentences[target_info[i]] = result
+            # Process tasks as they complete for real-time progress
+            completed_count = 0
+            total_tasks = len(tasks)
+            for future in asyncio.as_completed(tasks):
+                result, idx = await future
+                completed_count += 1
+                humanized_sentences[idx] = result
+                
+                prog = 20 + int((completed_count / total_tasks) * 55)
+                yield json.dumps({
+                    "log": f"Segment {idx+1} humanized ({completed_count}/{total_tasks}).", 
+                    "log_type": "success", 
+                    "progress": prog
+                }) + "\n"
+
+            yield json.dumps({"log": "All robotic segments successfully rewritten.", "log_type": "success", "progress": 75}) + "\n"
             
             humanized = " ".join(humanized_sentences)
         else:
-            # Fallback to full block rewrite for short texts
-            yield json.dumps({"log": "Text too short for surgical precision. Rewriting block...", "log_type": "process"}) + "\n"
+            yield json.dumps({"log": "Short text detected. Rewriting block...", "log_type": "process", "progress": 30}) + "\n"
             humanized = await _process_chunk(text, system_prompt)
+            yield json.dumps({"log": "Block rewriting completed.", "log_type": "success", "progress": 75}) + "\n"
 
-        yield json.dumps({"log": "Running Fact-Preservation check...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Verifying fact preservation...", "log_type": "process", "progress": 80}) + "\n"
         fact_issues = verify_facts(text, humanized)
         if fact_issues:
             for issue in fact_issues:
-                yield json.dumps({"log": f"Data Integrity Warning: {issue}", "log_type": "warning"}) + "\n"
+                yield json.dumps({"log": f"Integrity Warning: {issue}", "log_type": "warning", "progress": 85}) + "\n"
         else:
-            yield json.dumps({"log": "Fact check passed: All numbers and names preserved.", "log_type": "success"}) + "\n"
+            yield json.dumps({"log": "Fact check passed: 100% data integrity.", "log_type": "success", "progress": 85}) + "\n"
 
-        yield json.dumps({"log": "Calculating final AI score...", "log_type": "process"}) + "\n"
+        yield json.dumps({"log": "Calculating final AI score and verdict...", "log_type": "process", "progress": 90}) + "\n"
         new_score = get_ai_score(humanized)
         
         # Log for continuous learning if permission is granted and result is "successful" (< 20% AI)

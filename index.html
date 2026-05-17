@@ -78,6 +78,17 @@
                 <div id="outputContainer" class="w-full h-64 p-4 bg-gray-800 border border-gray-700 rounded-lg overflow-y-auto relative mb-4">
                     <p id="scoreText" class="text-xl font-bold text-yellow-400 mb-2"></p>
                     
+                    <!-- Real-time Progress Bar -->
+                    <div id="progressWrapper" class="hidden mb-6">
+                        <div class="flex justify-between mb-1">
+                            <span id="progressStatus" class="text-[10px] text-blue-300 uppercase tracking-wider font-bold">Initializing...</span>
+                            <span id="progressPercent" class="text-xs font-bold text-blue-400">0%</span>
+                        </div>
+                        <div class="w-full bg-gray-700 rounded-full h-2 shadow-inner">
+                            <div id="progressBar" class="bg-gradient-to-r from-blue-600 to-blue-400 h-2 rounded-full transition-all duration-500 ease-out" style="width: 0%"></div>
+                        </div>
+                    </div>
+
                     <div id="factWarning" class="hidden mb-4 p-2 bg-yellow-900/30 border border-yellow-700 rounded text-xs text-yellow-200"></div>
 
                     <!-- Metrics Breakdown -->
@@ -293,12 +304,22 @@
             const text = document.getElementById('inputText').value;
             const scoreDisplay = document.getElementById('scoreText');
             const outputDisplay = document.getElementById('outputText');
+            const progressWrapper = document.getElementById('progressWrapper');
+            const progressBar = document.getElementById('progressBar');
+            const progressPercent = document.getElementById('progressPercent');
+            const progressStatus = document.getElementById('progressStatus');
             
             // UI Reset
             document.getElementById('metricsGrid').classList.add('hidden');
             document.getElementById('heatmapContent').classList.add('hidden');
             document.getElementById('diffView').classList.add('hidden');
             document.getElementById('factWarning').classList.add('hidden');
+            
+            progressWrapper.classList.remove('hidden');
+            progressBar.style.width = '0%';
+            progressPercent.innerText = '0%';
+            progressStatus.innerText = 'Initializing Engine...';
+            
             outputDisplay.classList.remove('hidden');
 
             if (!text) return alert("Please enter text");
@@ -344,9 +365,19 @@
                             
                             if (data.log) {
                                 addLog(data.log, data.log_type || 'info');
+                                // Truncate long logs for the progress status bar for better readability
+                                progressStatus.innerText = data.log.length > 50 ? data.log.substring(0, 47) + '...' : data.log;
+                            }
+
+                            if (data.progress) {
+                                progressBar.style.width = `${data.progress}%`;
+                                progressPercent.innerText = `${data.progress}%`;
                             }
                             
                             if (data.final_result) {
+                                progressBar.style.width = '100%';
+                                progressPercent.innerText = '100%';
+                                setTimeout(() => progressWrapper.classList.add('hidden'), 1500);
                                 const res = data.final_result;
                                 if (type === 'detect') {
                                     scoreDisplay.innerText = `AI Probability: ${res.ai_probability}`;
