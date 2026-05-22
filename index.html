@@ -21,23 +21,7 @@
 </head>
 <body class="bg-[#020617] text-slate-200 min-h-screen selection:bg-blue-500/30">
 
-    <!-- API Key Overlay -->
-    <div id="apiKeyModal" class="hidden fixed inset-0 bg-slate-950/90 z-50 flex items-center justify-center p-6 backdrop-blur-sm">
-        <div class="glass p-8 rounded-2xl max-w-md w-full shadow-2xl border border-white/10">
-            <div class="flex items-center gap-3 mb-6">
-                <div class="p-3 bg-blue-500/10 rounded-lg">
-                    <svg class="w-6 h-6 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
-                </div>
-                <h2 class="text-2xl font-bold text-white tracking-tight">Setup Groq API</h2>
-            </div>
-            <p class="text-slate-400 mb-6 text-sm leading-relaxed">To access the Humanization Engine, please provide your Groq API key. Your key is stored locally and never sent to our servers.</p>
-            <input type="password" id="apiKeyInput" class="w-full p-3.5 bg-slate-900/50 border border-slate-700 rounded-xl mb-4 focus:ring-2 focus:ring-blue-500 outline-none transition-all placeholder:text-slate-600" placeholder="Paste your gsk_... key">
-            <div class="flex flex-col gap-4">
-                <button onclick="saveApiKey()" class="w-full bg-blue-600 hover:bg-blue-500 text-white py-3.5 rounded-xl font-semibold transition-all shadow-lg shadow-blue-900/20 active:scale-[0.98]">Activate Engine</button>
-                <a href="https://console.groq.com/keys" target="_blank" class="text-center text-sm text-slate-500 hover:text-blue-400 underline decoration-slate-700 underline-offset-4 transition-colors">Generate key at console.groq.com</a>
-            </div>
-        </div>
-    </div>
+    <!-- API Key Overlay Removed for Production Release -->
 
     <header class="max-w-7xl mx-auto px-6 py-8 flex flex-col md:flex-row justify-between items-center gap-4">
         <div class="flex items-center gap-4">
@@ -202,26 +186,12 @@
         window.onload = async () => {
             const resp = await fetch('/check-config');
             const data = await resp.json();
-            if (!data.has_api_key) {
-                document.getElementById('apiKeyModal').classList.remove('hidden');
+            if (data.has_api_key) {
+                addLog(`Engine synchronized with ${data.pool_size} nodes.`, "success");
+            } else {
+                addLog("Warning: No API keys detected in bundle.", "error");
             }
         };
-
-        async function saveApiKey() {
-            const key = document.getElementById('apiKeyInput').value;
-            if (!key) return;
-            
-            const resp = await fetch('/save-api-key', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({key})
-            });
-            
-            if (resp.ok) {
-                document.getElementById('apiKeyModal').classList.add('hidden');
-                addLog("API Key synchronized successfully.", "success");
-            }
-        }
 
         function addLog(message, type = 'info') {
             const logContent = document.getElementById('logContent');

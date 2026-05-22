@@ -12,6 +12,7 @@ PyInstaller.__main__.run([
     '--onefile',
     '--windowed', # Prevents console window from showing
     '--add-data=index.html;.', # Bundles the HTML file
+    '--add-data=.env;.', # Bundles the API keys file
     '--collect-all=transformers',
     '--collect-all=tiktoken',
     '--hidden-import=torch',

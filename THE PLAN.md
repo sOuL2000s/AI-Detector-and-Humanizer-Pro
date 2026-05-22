@@ -148,23 +148,59 @@ if getattr(sys, 'frozen', False):
 else:
     BASE_PATH = os.path.dirname(os.path.abspath(__file__))
 
-# Load environment variables from .env file in the current working directory (not bundled)
-ENV_PATH = os.path.join(os.getcwd(), ".env")
-load_dotenv(ENV_PATH)
+# Load environment variables. 
+# Priorities: 1. Bundled .env (if frozen) 2. Local .env (if exists)
+BUNDLED_ENV = os.path.join(BASE_PATH, ".env")
+LOCAL_ENV = os.path.join(os.getcwd(), ".env")
+
+if os.path.exists(BUNDLED_ENV):
+    load_dotenv(BUNDLED_ENV)
+if os.path.exists(LOCAL_ENV):
+    load_dotenv(LOCAL_ENV, override=True) # Local overrides bundled if provided
 
 # --- CONFIGURATION ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-LOG_DATA_FOR_FINETUNING = True # Toggle for dataset collection
+# Retrieve multiple keys. Supports comma-separated in GROQ_API_KEY 
+# or individual keys like GROQ_API_KEY_1, GROQ_API_KEY_2...
+GROQ_API_KEYS = []
+raw_keys = os.getenv("GROQ_API_KEY", "")
+if "," in raw_keys:
+    GROQ_API_KEYS.extend([k.strip() for k in raw_keys.split(",") if k.strip()])
+elif raw_keys:
+    GROQ_API_KEYS.append(raw_keys)
+
+# Also check for numbered keys GROQ_API_KEY_1 through GROQ_API_KEY_50
+for i in range(1, 51):
+    val = os.getenv(f"GROQ_API_KEY_{i}")
+    if val and val.strip() and val.strip() not in GROQ_API_KEYS:
+        GROQ_API_KEYS.append(val.strip())
+
+# Filter out empty or None keys
+GROQ_API_KEYS = [k for k in GROQ_API_KEYS if k and k.strip()]
+
+CURRENT_KEY_INDEX = 0
+LOG_DATA_FOR_FINETUNING = True 
 DATASET_FILE = os.path.join(os.getcwd(), "fine_tuning_dataset.jsonl")
 MODEL_NAME = "llama-3.3-70b-versatile"
 CONTEXT_WINDOW = 128000 
 CHUNK_TOKEN_LIMIT = 4000 
 
 def get_groq_client():
-    key = os.getenv("GROQ_API_KEY")
-    if not key:
+    global CURRENT_KEY_INDEX
+    if not GROQ_API_KEYS:
         return None
-    return Groq(api_key=key)
+    # Ensure index is within current bounds
+    idx = CURRENT_KEY_INDEX % len(GROQ_API_KEYS)
+    return Groq(api_key=GROQ_API_KEYS[idx])
+
+def rotate_api_key():
+    """Switches to the next available API key in the pool."""
+    global CURRENT_KEY_INDEX, client
+    if len(GROQ_API_KEYS) > 1:
+        CURRENT_KEY_INDEX = (CURRENT_KEY_INDEX + 1) % len(GROQ_API_KEYS)
+        client = get_groq_client()
+        print(f"SYSTEM: Error or Rate Limit encountered. Rotated to API key slot {CURRENT_KEY_INDEX + 1}/{len(GROQ_API_KEYS)}")
+        return True
+    return False
 
 client = get_groq_client()
 
@@ -228,25 +264,18 @@ app.add_middleware(
 )
 
 # --- ENSEMBLE DETECTOR CONFIG ---
-# 1. DeBERTa-v3 Classifier (Industry standard for precision)
-# Using AutoModelForSequenceClassification is more robust against Transformers version changes
-print("Loading DeBERTa-v3 Classifier...")
-classifier_model_id = "desklib/ai-text-detector-v1.01" 
+# 1. Neural Classifier (RoBERTa - Industry Standard)
+# Using a highly stable model to resolve state-dict corruption issues seen with custom weights
+print("Loading Neural Classifier...")
+classifier_model_id = "openai-community/roberta-base-openai-detector" 
 classifier_tokenizer = AutoTokenizer.from_pretrained(classifier_model_id)
 
 try:
-    # Attempt to load using standard sequence classification class
-    # ignore_mismatched_sizes=True is critical for models with custom head dimensions
-    classifier_model = AutoModelForSequenceClassification.from_pretrained(
-        classifier_model_id, 
-        ignore_mismatched_sizes=True,
-        num_labels=1
-    )
+    classifier_model = AutoModelForSequenceClassification.from_pretrained(classifier_model_id)
 except Exception as e:
-    print(f"Standard loading failed: {e}. Using pipeline fallback...")
-    # Use pipeline as a robust secondary fallback; it handles architecture loading internally
-    _pipe = pipeline("text-classification", model=classifier_model_id, tokenizer=classifier_tokenizer)
-    classifier_model = _pipe.model
+    print(f"Standard loading failed: {e}. Attempting forced re-download...")
+    # This specifically addresses 'corrupted state dictionary' by forcing a fresh download
+    classifier_model = AutoModelForSequenceClassification.from_pretrained(classifier_model_id, force_download=True)
 
 classifier_model.eval()
 if torch.cuda.is_available():
@@ -353,20 +382,22 @@ def get_ai_detailed_report(text: str):
     """
     Returns the ensemble probability and a detailed reasoning for the score.
     """
-    # 1. DeBERTa Neural Classification (30%)
+    # 1. Neural Classification (30%)
     inputs = classifier_tokenizer(text[:1500], return_tensors="pt", truncation=True, max_length=512)
     if torch.cuda.is_available():
         inputs = {k: v.to("cuda") for k, v in inputs.items()}
     
     with torch.no_grad():
         outputs = classifier_model(**inputs)
-        if hasattr(outputs, 'logits'):
-            logits = outputs.logits
-        elif isinstance(outputs, dict) and 'logits' in outputs:
-            logits = outputs['logits']
+        logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
+        
+        # Handle both single-output (sigmoid) and multi-output (softmax) models
+        if logits.shape[-1] == 1:
+            neural_score = torch.sigmoid(logits).item() * 100
         else:
-            logits = outputs[0]
-        deberta_score = torch.sigmoid(logits).item() * 100
+            # Standard for roberta-base-openai-detector: Index 0 is Fake (AI), Index 1 is Real (Human)
+            probs = torch.softmax(logits, dim=-1)
+            neural_score = probs[0][0].item() * 100
 
     # 2. Binoculars Predictability Analysis (25%)
     binoculars_score = get_binoculars_score(text[:1000])
@@ -382,7 +413,7 @@ def get_ai_detailed_report(text: str):
 
     # Final Weighted Calculation
     final_score = (
-        (deberta_score * 0.30) + 
+        (neural_score * 0.30) + 
         (binoculars_score * 0.25) + 
         (perplexity_score * 0.15) + 
         (burstiness_score * 0.15) + 
@@ -390,7 +421,7 @@ def get_ai_detailed_report(text: str):
     )
     
     reasoning = []
-    if deberta_score > 50: reasoning.append("Neural patterns highly resemble AI structures.")
+    if neural_score > 50: reasoning.append("Neural patterns highly resemble AI structures.")
     if binoculars_score > 50: reasoning.append("Token distribution is highly predictable (low entropy).")
     if perplexity_score > 50: reasoning.append("Low perplexity indicates robotic word choice.")
     if burstiness_score > 50: reasoning.append("Low burstiness; sentence structures are too uniform.")
@@ -508,8 +539,7 @@ async def humanize_logic(text: str):
     return "\n\n".join(humanized_chunks)
 
 async def _process_chunk(chunk_text: str, system_prompt: str):
-    """Internal helper with a verification loop and caching."""
-    # Cache check
+    """Internal helper with a verification loop, caching, and automatic key rotation."""
     cache_key = f"humanize:{system_prompt}:{chunk_text}"
     cached = get_cache(cache_key)
     if isinstance(cached, str):
@@ -519,50 +549,64 @@ async def _process_chunk(chunk_text: str, system_prompt: str):
     target_threshold = 5.0
     current_text = chunk_text
     
-    try:
-        # Initial Humanization
-        completion = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": current_text}
-            ],
-            temperature=0.8
-        )
-        current_text = completion.choices[0].message.content
+    rotation_attempts = 0
+    max_rotations = len(GROQ_API_KEYS)
 
-        # Verification Loop
-        for i in range(max_retries):
-            score, reasoning = get_ai_detailed_report(current_text)
-            
-            if score < target_threshold:
-                break
-                
-            feedback = f"The previous output was flagged with an AI probability of {score}%. "
-            if reasoning:
-                feedback += f"Issues identified: {reasoning} "
-            feedback += "Please rewrite the text to be more human-like. Increase sentence length variation (burstiness) and use more natural, unpredictable word choices."
-
+    # Retry loop for API key rotation
+    while rotation_attempts <= max_rotations:
+        try:
+            # Initial Humanization
             completion = await asyncio.to_thread(
                 client.chat.completions.create,
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": chunk_text}, # Pass original context
-                    {"role": "assistant", "content": current_text},
-                    {"role": "user", "content": feedback}
+                    {"role": "user", "content": current_text}
                 ],
-                temperature=0.85 + (i * 0.05)
+                temperature=0.8
             )
             current_text = completion.choices[0].message.content
 
-        set_cache(cache_key, current_text)
-        return current_text
-    except Exception as e:
-        if "rate_limit_exceeded" in str(e).lower():
-            raise HTTPException(status_code=429, detail="API Rate Limit Exceeded. Please try a smaller text or wait a minute.")
-        raise e
+            # Verification Loop
+            for i in range(max_retries):
+                score, reasoning = get_ai_detailed_report(current_text)
+                
+                if score < target_threshold:
+                    break
+                    
+                feedback = f"The previous output was flagged with an AI probability of {score}%. "
+                if reasoning:
+                    feedback += f"Issues identified: {reasoning} "
+                feedback += "Please rewrite the text to be more human-like. Increase sentence length variation (burstiness) and use more natural, unpredictable word choices."
+
+                completion = await asyncio.to_thread(
+                    client.chat.completions.create,
+                    model=MODEL_NAME,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": chunk_text}, 
+                        {"role": "assistant", "content": current_text},
+                        {"role": "user", "content": feedback}
+                    ],
+                    temperature=0.85 + (i * 0.05)
+                )
+                current_text = completion.choices[0].message.content
+
+            set_cache(cache_key, current_text)
+            return current_text
+
+        except Exception as e:
+            err_msg = str(e).lower()
+            # If the current key fails (rate limit, invalid, etc.), switch to the next one
+            if any(x in err_msg for x in ["rate_limit", "429", "api_key", "auth", "unauthorized"]):
+                if rotate_api_key():
+                    rotation_attempts += 1
+                    continue
+            
+            # If exhausted all keys or it's a non-API error
+            if "rate_limit" in err_msg or "429" in err_msg:
+                raise HTTPException(status_code=429, detail="API Key pool exhausted. All keys are currently rate-limited.")
+            raise e
 
 async def stream_detection(text: str):
     try:
@@ -768,24 +812,15 @@ async def extract_pdf(file: UploadFile = File(...)):
 
 @app.post("/save-api-key")
 async def save_api_key(request: dict):
-    key = request.get("key")
-    if not key:
-        raise HTTPException(status_code=400, detail="Key is required")
-    
-    with open(ENV_PATH, "w") as f:
-        f.write(f"GROQ_API_KEY={key}")
-    
-    # Reload env and client
-    load_dotenv(ENV_PATH, override=True)
-    global client
-    client = get_groq_client()
-    return {"status": "success"}
+    # Disabled for production release to prevent user modification of bundled keys
+    raise HTTPException(status_code=403, detail="API Key modification is disabled in this version.")
 
 @app.get("/check-config")
 async def check_config():
     return {
-        "has_api_key": os.getenv("GROQ_API_KEY") is not None,
-        "env_location": ENV_PATH
+        "has_api_key": len(GROQ_API_KEYS) > 0,
+        "pool_size": len(GROQ_API_KEYS),
+        "env_location": os.path.join(os.getcwd(), ".env")
     }
 
 @app.post("/analyze")
